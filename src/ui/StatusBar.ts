@@ -80,6 +80,7 @@ export class StatusBar {
     this.perf.textContent = `${s.fps.toFixed(0)} FPS · CPU ${s.frameMs.toFixed(1)} ms${gpu} · ${s.drawCalls} draws · ${(s.triangles / 1000).toFixed(0)}k tris`;
     const g = v.globe.stats;
     let tilesText = `瓦片 ${g.rendered} / 缓存 ${g.cached} · L${g.maxLevel}`;
+    if (g.waitingImagery > 0) tilesText += ` · 待影像 ${g.waitingImagery}`;
     let busy = g.loading > 0;
     for (const t of v.tilesets) {
       const ts = (t.tiles as unknown as { stats: { visible?: number; downloading?: number; parsing?: number } }).stats;

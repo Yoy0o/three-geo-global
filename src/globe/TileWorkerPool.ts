@@ -70,7 +70,9 @@ export class TileWorkerPool {
       this.jobs.set(id, { resolve, reject, worker: index });
       this.load[index]++;
       const request: BuildTileRequest = { type: 'build', id, ...params };
-      this.workers[index].postMessage(request);
+      // The upsample grid is a private copy: hand it over instead of cloning it again.
+      const transfer = params.upsample ? [params.upsample.heights.buffer as ArrayBuffer] : [];
+      this.workers[index].postMessage(request, transfer);
       signal?.addEventListener(
         'abort',
         () => {

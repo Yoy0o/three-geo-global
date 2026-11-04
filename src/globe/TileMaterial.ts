@@ -34,6 +34,14 @@ export interface TileMaterial extends MeshBasicNodeMaterial {
   imageryMap: Texture;
   /** (offsetU, offsetV, scaleU, scaleV) into `imageryMap` (magnified ancestor fallback). */
   imageryTransform: Vector4;
+  /**
+   * Previous imagery while cross-fading (a magnified ancestor or the
+   * placeholder). Equal to `imageryMap` with `fade = 1` when not fading.
+   */
+  fadeMap: Texture;
+  fadeTransform: Vector4;
+  /** 0 = show `fadeMap`, 1 = show `imageryMap`. */
+  fade: number;
   /** Transparent overlay drawn over the imagery (rasterized vector layers). */
   overlayMap: Texture;
   overlayTransform: Vector4;
@@ -108,12 +116,18 @@ function sharedNodes(): SharedNodes {
 
   const imageryUV = uv().mul(imageryTransform.zw).add(imageryTransform.xy);
   const imagery: TSLNode = (materialReference('imageryMap', 'texture') as TSLNode).context({ getUV: () => imageryUV });
+  // Cross-fade source. Sampled unconditionally (texture fetches must stay in uniform
+  // control flow); when not fading it is the same texels as `imagery`, so it is ~free.
+  const fadeTransform: TSLNode = materialReference('fadeTransform', 'vec4');
+  const fadeUV = uv().mul(fadeTransform.zw).add(fadeTransform.xy);
+  const previous: TSLNode = (materialReference('fadeMap', 'texture') as TSLNode).context({ getUV: () => fadeUV });
+  const fade: TSLNode = materialReference('fade', 'float');
   const overlayTransform: TSLNode = materialReference('overlayTransform', 'vec4');
   const overlayUV = uv().mul(overlayTransform.zw).add(overlayTransform.xy);
   const overlay: TSLNode = (materialReference('overlayMap', 'texture') as TSLNode).context({ getUV: () => overlayUV });
 
   const colorNode = Fn(() => {
-    const albedo = vec3(imagery.rgb).toVar();
+    const albedo = vec3(mix(previous.rgb, imagery.rgb, fade)).toVar();
     // Draped overlays (vectors) sit on the ground, so they are lit and hazed like it.
     albedo.assign(mix(albedo, overlay.rgb, overlay.a));
 
@@ -151,6 +165,9 @@ export function createTileMaterial(texture: Texture = placeholder, level = 0): T
   material.name = 'GlobeTile';
   material.imageryMap = texture;
   material.imageryTransform = new Vector4(0, 0, 1, 1);
+  material.fadeMap = texture;
+  material.fadeTransform = new Vector4(0, 0, 1, 1);
+  material.fade = 1;
   material.overlayMap = EMPTY_OVERLAY;
   material.overlayTransform = new Vector4(0, 0, 1, 1);
   material.tileLevel = level;

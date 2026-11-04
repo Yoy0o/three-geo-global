@@ -23,6 +23,11 @@ export interface RasterTerrainSource extends TerrainSourceBase {
   encoding: TerrainEncoding;
   /** URL template with {z} {x} {y} placeholders. */
   url: string;
+  /**
+   * Pixels per tile edge (default 256). Larger tiles serve more mesh tiles
+   * per request: see `terrainLevelOffset`.
+   */
+  tileSize?: number;
 }
 
 /**
@@ -76,6 +81,7 @@ export function maptilerTerrain(key: string): RasterTerrainSource {
     encoding: 'mapbox',
     url: `https://api.maptiler.com/tiles/terrain-rgb-v2/{z}/{x}/{y}.webp?key=${encodeURIComponent(key)}`,
     maxZoom: 14,
+    tileSize: 512,
     heightReference: 'msl',
     attribution: 'Terrain © MapTiler © OpenStreetMap contributors',
   };

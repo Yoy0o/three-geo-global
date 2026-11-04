@@ -2,12 +2,18 @@
  * Builds globe tile meshes off the main thread: fetches and decodes raster
  * elevation tiles, samples them onto a regular grid in Web Mercator space,
  * converts to ECEF, adds skirts and computes culling volumes.
+ *
+ * Raster terrain is read from the tile `terrainLevelOffset` levels up (one
+ * 256 px tile serves 8 x 8 mesh tiles at full resolution). Requests carrying
+ * an `upsample` grid are answered at once from the ancestor's heights while
+ * the exact terrain tile is prefetched for the follow-up request.
  */
 import { computeHorizonCullingPoint, geodeticNormal, geodeticToEcef, mercatorVToLatitude, WGS84_A } from '../core/geodesy';
 import { geoidUndulation } from '../core/Geoid';
 import type { BuildTileRequest, BuiltTile, WorkerRequest, WorkerResponse } from './workerProtocol';
 import { isQuantizedMesh, type QuantizedMeshTerrainSource, type RasterTerrainSource, type TerrainSource } from './terrain/TerrainSource';
 import { decodeQuantizedMesh, geographicTileRect, isTileAvailable, rasterizeQuantizedMesh, sampleGrid } from './terrain/quantizedMesh';
+import { rasterSourceTile, terrainLevelOffset, upsampleHeightGrid } from './terrain/terrainTiling';
 
 // Minimal worker scope typing (the project compiles against the DOM lib).
 declare const self: {
@@ -93,14 +99,15 @@ function sampleHeight(img: HeightImage, u: number, v: number): number {
   return a * (1 - ty) + b * ty;
 }
 
+function sourceTileFor(req: BuildTileRequest, src: RasterTerrainSource) {
+  return rasterSourceTile(req.level, req.x, req.y, src.maxZoom, terrainLevelOffset(src.tileSize ?? 256, req.segments));
+}
+
 async function sampleTerrainGrid(req: BuildTileRequest, src: RasterTerrainSource): Promise<Float32Array> {
   const N = req.segments;
-  const { level, x, y } = req;
-  // Tiles deeper than the source's max zoom sample a sub-rectangle of their ancestor.
-  const dz = Math.max(0, level - src.maxZoom);
-  const sz = level - dz;
-  const sx = x >> dz;
-  const sy = y >> dz;
+  const { x, y } = req;
+  // Each mesh tile samples a sub-rectangle of a coarser elevation tile.
+  const { z: sz, x: sx, y: sy, dz } = sourceTileFor(req, src);
   const scale = 1 / 2 ** dz;
   const offU = (x - sx * 2 ** dz) * scale;
   const offV = (y - sy * 2 ** dz) * scale;
@@ -157,6 +164,23 @@ function loadGeoTile(src: QuantizedMeshTerrainSource, level: number, x: number, 
   return entry;
 }
 
+/** Geographic tiles (level, column, row range) covering a mercator mesh tile. */
+function geoTilesFor(req: BuildTileRequest, src: QuantizedMeshTerrainSource) {
+  const n = 2 ** req.level;
+  const west = (req.x / n) * 360 - 180;
+  const toDeg = 180 / Math.PI;
+  const latN = mercatorVToLatitude(req.y / n) * toDeg;
+  const latS = mercatorVToLatitude((req.y + 1) / n) * toDeg;
+  // A geographic tile at level g is as wide as a mercator tile at level g + 1,
+  // so one column covers this tile; it spans at most a couple of rows.
+  const g = Math.max(0, Math.min(src.geographicMaxZoom, req.level - 1));
+  const size = 180 / 2 ** g;
+  const gx = Math.min(2 ** (g + 1) - 1, Math.max(0, Math.floor((west + 180) / size + 1e-9)));
+  const maxRow = 2 ** g - 1;
+  const rowOf = (lat: number) => Math.min(maxRow, Math.max(0, Math.floor((lat + 90) / size)));
+  return { g, gx, rowOf, r0: rowOf(latS), r1: rowOf(latN - 1e-9) };
+}
+
 async function sampleQuantizedMesh(req: BuildTileRequest, src: QuantizedMeshTerrainSource): Promise<Float32Array> {
   const N = req.segments;
   const row = N + 1;
@@ -166,18 +190,8 @@ async function sampleQuantizedMesh(req: BuildTileRequest, src: QuantizedMeshTerr
   const vNorth = req.y / n;
   const vSouth = (req.y + 1) / n;
   const toDeg = 180 / Math.PI;
-  const latN = mercatorVToLatitude(vNorth) * toDeg;
-  const latS = mercatorVToLatitude(vSouth) * toDeg;
 
-  // A geographic tile at level g is as wide as a mercator tile at level g + 1,
-  // so one column covers this tile; it spans at most a couple of rows.
-  const g = Math.max(0, Math.min(src.geographicMaxZoom, req.level - 1));
-  const size = 180 / 2 ** g;
-  const gx = Math.min(2 ** (g + 1) - 1, Math.max(0, Math.floor((west + 180) / size + 1e-9)));
-  const maxRow = 2 ** g - 1;
-  const rowOf = (lat: number) => Math.min(maxRow, Math.max(0, Math.floor((lat + 90) / size)));
-  const r0 = rowOf(latS);
-  const r1 = rowOf(latN - 1e-9);
+  const { g, gx, rowOf, r0, r1 } = geoTilesFor(req, src);
   const tiles = new Map<number, GeoTile | null>();
   await Promise.all(
     Array.from({ length: r1 - r0 + 1 }, (_, i) => r0 + i).map(async (r) => tiles.set(r, await loadGeoTile(src, g, gx, r))),
@@ -205,7 +219,11 @@ async function sampleQuantizedMesh(req: BuildTileRequest, src: QuantizedMeshTerr
   return heights;
 }
 
-function buildMesh(req: BuildTileRequest, heights: Float32Array | null, src: TerrainSource | null): BuiltTile {
+/**
+ * `ellipsoidal`: heights are already ellipsoidal and exaggerated (upsampled
+ * from an ancestor mesh), so no geoid correction is applied.
+ */
+function buildMesh(req: BuildTileRequest, heights: Float32Array | null, src: TerrainSource | null, ellipsoidal = false): BuiltTile {
   const N = req.segments;
   const row = N + 1;
   const gridCount = row * row;
@@ -221,7 +239,7 @@ function buildMesh(req: BuildTileRequest, heights: Float32Array | null, src: Ter
   for (let j = 0; j <= N; j++) lats[j] = mercatorVToLatitude(vNorth + ((vSouth - vNorth) * j) / N);
 
   // MSL -> ellipsoidal heights (EGM96), so terrain and 3D Tiles share one datum.
-  if (heights && src?.heightReference === 'msl') {
+  if (heights && !ellipsoidal && src?.heightReference === 'msl') {
     for (let j = 0; j <= N; j++) {
       for (let i = 0; i <= N; i++) {
         heights[j * row + i] += geoidUndulation(west + ((east - west) * i) / N, lats[j]);
@@ -399,7 +417,19 @@ function buildMesh(req: BuildTileRequest, heights: Float32Array | null, src: Ter
     boundingRadius: Math.sqrt(radiusSq),
     horizonPoint,
     heights,
+    upsampled: false,
   };
+}
+
+/** Starts downloading the terrain an exact build of this tile will need (errors are retried then). */
+function prefetchTerrain(req: BuildTileRequest, src: TerrainSource): void {
+  if (isQuantizedMesh(src)) {
+    const { g, gx, r0, r1 } = geoTilesFor(req, src);
+    for (let r = r0; r <= r1; r++) loadGeoTile(src, g, gx, r).catch(() => undefined);
+  } else {
+    const t = sourceTileFor(req, src);
+    getHeightImage(src, t.z, t.x, t.y).catch(() => undefined);
+  }
 }
 
 async function handleBuild(req: BuildTileRequest): Promise<void> {
@@ -407,12 +437,21 @@ async function handleBuild(req: BuildTileRequest): Promise<void> {
   try {
     const src = req.terrainId ? (sources.get(req.terrainId) ?? null) : null;
     if (req.terrainId && !src) throw new Error(`unknown terrain source ${req.terrainId}`);
-    const heights = src ? await (isQuantizedMesh(src) ? sampleQuantizedMesh(req, src) : sampleTerrainGrid(req, src)) : null;
-    if (cancelled.delete(req.id)) {
-      post({ type: 'error', id: req.id, message: 'cancelled', aborted: true });
-      return;
+    let tile: BuiltTile;
+    if (src && req.upsample) {
+      const u = req.upsample;
+      const heights = upsampleHeightGrid(u.heights, u.segments, u.level, u.x, u.y, req.level, req.x, req.y, req.segments);
+      prefetchTerrain(req, src);
+      tile = buildMesh(req, heights, src, true);
+      tile.upsampled = true;
+    } else {
+      const heights = src ? await (isQuantizedMesh(src) ? sampleQuantizedMesh(req, src) : sampleTerrainGrid(req, src)) : null;
+      if (cancelled.delete(req.id)) {
+        post({ type: 'error', id: req.id, message: 'cancelled', aborted: true });
+        return;
+      }
+      tile = buildMesh(req, heights, src);
     }
-    const tile = buildMesh(req, heights, src);
     const transfer: Transferable[] = [tile.positions.buffer, tile.normals.buffer, tile.uvs.buffer, tile.indices.buffer];
     if (tile.heights) transfer.push(tile.heights.buffer);
     post(tile, transfer);

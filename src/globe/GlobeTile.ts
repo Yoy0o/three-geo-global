@@ -1,5 +1,6 @@
 import { Mesh, Sphere, Texture, Vector3 } from 'three';
 import { computeHorizonCullingPoint, geodeticToEcef } from '../core/geodesy';
+import { sampleHeightGrid } from './terrain/terrainTiling';
 import type { GeoRect, WebMercatorTilingScheme } from './TilingScheme';
 import { createTileMaterial, type TileMaterial } from './TileMaterial';
 
@@ -27,6 +28,30 @@ export class SharedTexture {
   }
 }
 
+/** Load state of one kind of tile content (geometry, imagery or overlay). */
+export class LoadChannel {
+  /** In-flight request (kept until its result has been applied or discarded). */
+  loading: AbortController | null = null;
+  retryAt = 0;
+  failures = 0;
+  /** Sort key for this frame's queue (lower loads first). */
+  priority = 0;
+  /** Priority bucket for this frame's queue. */
+  bucket = 0;
+  /** Last frame the content was wanted; in-flight loads not wanted for a while are cancelled. */
+  wantedFrame = -1;
+
+  fail(now: number): void {
+    this.failures++;
+    this.retryAt = now + Math.min(30_000, 1000 * 2 ** this.failures);
+  }
+
+  succeed(): void {
+    this.failures = 0;
+    this.retryAt = 0;
+  }
+}
+
 const _pts = new Float64Array(5 * 5 * 2 * 3);
 const _p = [0, 0, 0];
 const _v = new Vector3();
@@ -49,11 +74,18 @@ export class GlobeTile {
   heights: Float32Array | null = null;
   segments = 0;
   geometryGen = -1;
+  /** Mesh was built from an ancestor's heights; the exact terrain is still to come. */
+  upsampled = false;
+  /** Level whose terrain data the mesh was built from (-1 = none, e.g. the flat start-up mesh). */
+  dataLevel = -1;
   imageryGen = -1;
   /** Imagery fetched for this exact tile (null when magnifying an ancestor). */
   ownImagery: SharedTexture | null = null;
-  /** Imagery currently used for rendering (own or ancestor's). */
+  /** Imagery currently used for rendering (own, an ancestor's, or the placeholder). */
   imagery: SharedTexture | null = null;
+  /** Previous imagery while cross-fading to `imagery`. */
+  fadeFrom: SharedTexture | null = null;
+  fadeStart = 0;
   /** Overlay (e.g. rasterized vectors) produced for this exact tile. */
   ownOverlay: SharedTexture | null = null;
   /** Overlay used for rendering: own, a magnified ancestor's, or the empty texture. */
@@ -63,16 +95,16 @@ export class GlobeTile {
   readonly material: TileMaterial;
 
   // Loading.
-  loading: AbortController | null = null;
-  retryAt = 0;
-  failures = 0;
+  readonly geo = new LoadChannel();
+  readonly img = new LoadChannel();
+  readonly ovl = new LoadChannel();
+  /** Bumped when content is unloaded, so late results for the old content are dropped. */
+  epoch = 0;
   lastVisitedFrame = -1;
   lastRenderedFrame = -1;
 
   // Per-frame metrics.
   distance = 0;
-  /** Load priority (lower loads first). */
-  priority = 0;
 
   constructor(
     readonly level: number,
@@ -93,9 +125,20 @@ export class GlobeTile {
     this.estimateBounds();
   }
 
-  /** Whether the tile can be drawn (geometry and some imagery available). */
+  /** Whether the tile can be drawn. Imagery always resolves (own, ancestor or placeholder). */
   get renderable(): boolean {
-    return this.mesh !== null && this.imagery !== null;
+    return this.mesh !== null;
+  }
+
+  /** Any request in flight. */
+  get loading(): boolean {
+    return this.geo.loading !== null || this.img.loading !== null || this.ovl.loading !== null;
+  }
+
+  abortAll(): void {
+    this.geo.loading?.abort();
+    this.img.loading?.abort();
+    this.ovl.loading?.abort();
   }
 
   /** Conservative bounds from a 5x5 sample of the tile at min/max height. */
@@ -124,15 +167,20 @@ export class GlobeTile {
     this.horizonPoint = hp ? new Vector3(hp[0], hp[1], hp[2]) : null;
   }
 
-  createChildren(scheme: WebMercatorTilingScheme): GlobeTile[] {
+  /**
+   * Creates the four children. They inherit a height range (default: this
+   * tile's, slightly padded) for culling until their own data arrives; pass a
+   * wider range when this tile's heights are only an estimate.
+   */
+  createChildren(scheme: WebMercatorTilingScheme, range?: [number, number]): GlobeTile[] {
     if (!this.children) {
       const z = this.level + 1;
       const x = this.x * 2;
       const y = this.y * 2;
-      // Children inherit the parent's height range (slightly padded) until their own data arrives.
-      const pad = (this.maxHeight - this.minHeight) * 0.1;
-      const lo = this.minHeight - pad;
-      const hi = this.maxHeight + pad;
+      const [min, max] = range ?? [this.minHeight, this.maxHeight];
+      const pad = (max - min) * 0.1;
+      const lo = min - pad;
+      const hi = max + pad;
       this.children = [
         new GlobeTile(z, x, y, this, scheme, lo, hi),
         new GlobeTile(z, x + 1, y, this, scheme, lo, hi),
@@ -145,18 +193,6 @@ export class GlobeTile {
 
   /** Bilinear height sample at normalized tile coordinates (u east, v south). */
   sampleHeight(u: number, v: number): number | null {
-    const h = this.heights;
-    if (!h) return null;
-    const n = this.segments;
-    const fx = Math.min(n, Math.max(0, u * n));
-    const fy = Math.min(n, Math.max(0, v * n));
-    const x0 = Math.min(n - 1, Math.floor(fx));
-    const y0 = Math.min(n - 1, Math.floor(fy));
-    const tx = fx - x0;
-    const ty = fy - y0;
-    const row = n + 1;
-    const a = h[y0 * row + x0] * (1 - tx) + h[y0 * row + x0 + 1] * tx;
-    const b = h[(y0 + 1) * row + x0] * (1 - tx) + h[(y0 + 1) * row + x0 + 1] * tx;
-    return a * (1 - ty) + b * ty;
+    return this.heights ? sampleHeightGrid(this.heights, this.segments, u, v) : null;
   }
 }
