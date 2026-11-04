@@ -1,0 +1,28 @@
+{
+  "name": "three-geo-global",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "WebGPU-first 3D globe viewer built on three.js: quadtree imagery tiles, terrain, atmosphere and OGC 3D Tiles.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "3d-tiles-renderer": "0.5.3",
+    "three": "0.186.1"
+  },
+  "devDependencies": {
+    "@types/three": "0.186.0",
+    "@webgpu/types": "0.1.74",
+    "typescript": "5.9.3",
+    "vite": "8.3.4",
+    "vitest": "5.0.5"
+  },
+  "engines": {
+    "node": ">=20.19"
+  }
+}
