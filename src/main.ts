@@ -2,6 +2,7 @@ import './style.css';
 import { AWS_TERRARIUM } from './globe/terrain/TerrainSource';
 import { ControlPanel, createImagery } from './ui/ControlPanel';
 import { h } from './ui/dom';
+import { FeaturePopup } from './ui/FeaturePopup';
 import { loadSettings } from './ui/settings';
 import { StatusBar } from './ui/StatusBar';
 import { GeoViewer, type ViewPosition } from './viewer/GeoViewer';
@@ -78,8 +79,13 @@ async function main(): Promise<void> {
     h('strong', {}, 'Three Geo Global'),
     h('span', {}, '左键拖拽旋转 · 滚轮缩放 · 右键/Ctrl 拖拽倾斜旋转 · 双击飞近'),
   );
-  app.append(title, panel.root, status.root, status.compass);
+  const popup = new FeaturePopup(viewer);
+  app.append(title, panel.root, status.root, status.compass, popup.root);
   syncHash(viewer);
+  enableFileDrop(app, (files) => void panel.vectorPanel.loadFiles(files));
+
+  // ?geojson=<url> loads a GeoJSON layer on startup (repeatable).
+  for (const url of params.getAll('geojson')) panel.vectorPanel.load({ url }, !location.hash);
 
   // ?tileset=<url> loads a 3D Tiles dataset on startup.
   const tileset = params.get('tileset');
@@ -92,6 +98,35 @@ async function main(): Promise<void> {
 
   // Handy for debugging from the console.
   (window as unknown as { viewer: GeoViewer }).viewer = viewer;
+}
+
+/** Drag GeoJSON files anywhere onto the page to load them. */
+function enableFileDrop(app: HTMLElement, onFiles: (files: File[]) => void): void {
+  const overlay = h('div', { class: 'drop-overlay', hidden: true }, h('div', {}, '释放以加载 GeoJSON 文件'));
+  app.append(overlay);
+  let depth = 0;
+  const hasFiles = (e: DragEvent) => !!e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+  window.addEventListener('dragenter', (e) => {
+    if (!hasFiles(e)) return;
+    depth++;
+    overlay.hidden = false;
+  });
+  window.addEventListener('dragleave', (e) => {
+    if (!hasFiles(e)) return;
+    depth = Math.max(0, depth - 1);
+    if (depth === 0) overlay.hidden = true;
+  });
+  window.addEventListener('dragover', (e) => {
+    if (hasFiles(e)) e.preventDefault();
+  });
+  window.addEventListener('drop', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    overlay.hidden = true;
+    const files = [...(e.dataTransfer?.files ?? [])];
+    if (files.length) onFiles(files);
+  });
 }
 
 void main();

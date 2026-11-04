@@ -54,6 +54,11 @@ export class GlobeTile {
   ownImagery: SharedTexture | null = null;
   /** Imagery currently used for rendering (own or ancestor's). */
   imagery: SharedTexture | null = null;
+  /** Overlay (e.g. rasterized vectors) produced for this exact tile. */
+  ownOverlay: SharedTexture | null = null;
+  /** Overlay used for rendering: own, a magnified ancestor's, or the empty texture. */
+  overlay: SharedTexture | null = null;
+  overlayGen = -1;
   /** Per-tile material instance; all tiles share one node graph / GPU pipeline. */
   readonly material: TileMaterial;
 

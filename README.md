@@ -1,6 +1,6 @@
 # Three Geo Global
 
-基于 three.js 的 **WebGPU 优先** 三维地理空间浏览器：WGS84 椭球、四叉树影像瓦片、全球地形、物理大气、OGC 3D Tiles。
+基于 three.js 的 **WebGPU 优先** 三维地理空间浏览器：WGS84 椭球、四叉树影像瓦片、全球地形、物理大气、OGC 3D Tiles、GeoJSON 矢量与注记。
 对标 CesiumJS / Google Earth 的核心浏览体验，先实现一个可扩展的基础版本。
 
 | 全球视角（WebGPU） | 近地轨道大气 | 昼夜晨昏线 |
@@ -10,6 +10,10 @@
 | 北京西山日落（地形 + 大气） | 地形 + 四叉树 LOD（调试网格） | 3D Tiles 贴合地形 |
 | --- | --- | --- |
 | ![sunset](docs/images/sunset.jpg) | ![terrain](docs/images/terrain-lod.jpg) | ![3dtiles](docs/images/3dtiles-on-terrain.jpg) |
+
+| GeoJSON：国界分色 + 城市点 + 中文注记避让 | 点击要素：属性面板 + 高亮 |
+| --- | --- |
+| ![geojson](docs/images/geojson-labels.jpg) | ![popup](docs/images/feature-popup.jpg) |
 
 > 截图在无头 Chromium（SwiftShader 软件 GPU）里生成，沙箱访问不了 ArcGIS/OSM，所以用的是 Blue Marble 单图和调试网格影像。本地运行默认是 ArcGIS 卫星影像。
 
@@ -32,6 +36,7 @@ npm test           # 核心数学单元测试（vitest）
 | `?imagery=osm` | 指定底图：`esri-imagery` `osm` `carto-voyager` `carto-dark` `esri-topo` `tianditu-img` `blue-marble` `debug` |
 | `?noterrain` | 启动时关闭地形 |
 | `?tileset=<url>` | 启动后加载一个 3D Tiles（tileset.json） |
+| `?geojson=<url>` | 启动后加载 GeoJSON（可重复多次） |
 | `#lon,lat,height,heading,pitch` | 相机位置（会随浏览自动更新，可直接分享链接） |
 
 ### 操作
@@ -40,6 +45,8 @@ npm test           # 核心数学单元测试（vitest）
 - 滚轮 / 双指捏合：向光标处缩放
 - 右键、中键或 Ctrl/Shift + 左键拖拽：绕光标处的点旋转航向、调整俯仰
 - 双击：飞近该点；指北针：点击复位朝北
+- 单击矢量要素或注记：弹出属性面板并高亮；Esc 关闭
+- 把 `.geojson` / `.json` 文件直接拖进窗口即可加载
 - 键盘：WASD / 方向键平移，Q/E 转向，R/F 俯仰
 
 ## 已实现能力
@@ -70,6 +77,16 @@ npm test           # 核心数学单元测试（vitest）
 - Draco / KTX2 / Meshopt 解码；Cesium ion、Google 真实感 3D Tiles 鉴权；GPU 显存回收
 - 图层管理：显隐、飞到图层、高度偏移、一键贴地（针对以椭球面为基准的样例数据）
 
+**GeoJSON 矢量与注记**
+- 支持 Point / MultiPoint / LineString / MultiLineString / Polygon / MultiPolygon / GeometryCollection，来源可以是 URL、本地文件（拖拽）或对象
+- 解析、投影、跨日界线展开、网格空间索引都在 **Web Worker** 里完成，大文件不卡主线程
+- 线、面、点符号按地球瓦片实时栅格化成透明叠加纹理，**贴合地形**、无 Z-fighting；只重绘受影响区域的瓦片（按区域失效），加载期间用父瓦片叠加图放大兜底
+- 样式：图层级填充 / 描边 / 点样式，按属性分类着色（如 Natural Earth `MAPCOLOR7`），兼容 simplestyle-spec 逐要素样式
+- 注记：自动识别名称字段（优先中文 `name_zh` / `NAME_ZH`），面用“极点不可达点”（polylabel）、线用中点定位；按 `LABELRANK` / `scalerank` 排优先级，按 `min_label` / `min_zoom` 分级显示，屏幕空间碰撞避让 + 淡入淡出
+- 注记位置用 GPU 端双精度模拟（RTE，高低位拆分），近距离也不抖；可见性由 CPU 判定（地平线 + 低空时沿视线采样地形遮挡）
+- 点击查询：注记命中优先，其次在 Worker 里做点在面内 / 点到线距离判定，返回属性并高亮该要素
+- 预设数据：Natural Earth 国界、省级区划、城市、河流（公有领域，示例用）
+
 **交互与界面**
 - 自研相机控制器（抓取式旋转、光标缩放、绕点环绕、惯性、触屏手势、键盘漫游、防入地）
 - 大圆弧线飞行（高度随距离抬升，飞行中自动俯视）
@@ -85,13 +102,18 @@ flowchart LR
     V --> G["Globe<br/>四叉树 · 调度 · 缓存"]
     V --> T["Tiles3DLayer<br/>3DTilesRendererJS"]
     V --> A["大气 / 星空<br/>TSL 节点"]
+    V --> L["LabelManager<br/>注记图集 · 避让"]
+    V --> VS["VectorService<br/>图层顺序 · 区域失效"]
     G --> M["TileMaterial<br/>共享节点图"]
     G --> I["ImageryProvider"]
+    VS -->|"叠加纹理"| G
   end
-  subgraph Workers["Web Worker 池"]
+  subgraph Workers["Web Worker"]
     W["tileMesh.worker<br/>地形解码 · EGM96 · 构网"]
+    VW["vector.worker<br/>GeoJSON 解析 · 索引 · 栅格化 · 查询"]
   end
   G <-->|"transferable 缓冲区"| W
+  VS <-->|"ImageBitmap"| VW
   V --> R["WebGPURenderer<br/>WebGPU / WebGL2"]
 ```
 
@@ -101,6 +123,7 @@ src/
 ├─ globe/       四叉树（Globe / GlobeTile）、分块方案、Worker、影像源、地形源、瓦片材质
 ├─ atmosphere/  散射节点（天空 / 空气透视）、星空
 ├─ tiles3d/     3D Tiles 图层封装
+├─ vector/      GeoJSON 图层、矢量 Worker、注记管理、几何算法
 ├─ viewer/      GeoViewer、相机控制器、相机数学、飞行动画
 └─ ui/          控制面板、状态栏、预设
 ```
@@ -120,6 +143,13 @@ const viewer = await GeoViewer.create({
 viewer.lighting = true;
 await viewer.flyTo({ longitude: 116.397, latitude: 39.916, height: 3000, heading: 0, pitch: -40 });
 viewer.addTileset({ source: { type: 'url', url: 'https://example.com/tileset.json' } });
+
+const countries = viewer.addGeoJson({
+  url: 'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson',
+  style: { colorBy: 'MAPCOLOR7', fillOpacity: 0.2, stroke: '#ffffff' },
+  label: { field: 'NAME_ZH' },
+});
+countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
 ```
 
 ## 与成熟产品对标
@@ -134,7 +164,7 @@ viewer.addTileset({ source: { type: 'url', url: 'https://example.com/tileset.jso
 | 3D Tiles | ✅ 原生 | 自有格式 | 自有 3D 格式 | ✅ I3S / 3D Tiles | ✅ 3DTilesRendererJS |
 | 大气 | ✅ | ✅ | 风格化 | ✅ | ✅ 物理散射 + 光晕 |
 | 昼夜 / 太阳 | ✅ | ✅ | 风格化光照 | ✅ | ✅ 按日期计算太阳位置 |
-| 矢量 / 标注 | ✅ | ✅ | ✅ 强项 | ✅ | ⏳ 路线图 |
+| 矢量 / 标注 | ✅ | ✅ | ✅ 强项 | ✅ | ✅ GeoJSON 贴地 + 注记避让 |
 | 阴影 / 后处理 | ✅ | ✅ | 部分 | ✅ | ⏳ 路线图 |
 
 定位：在 three.js 生态里做一个“像 Cesium 一样懂地理、像 three.js 一样好扩展”的地球底座，并且从第一天起按 WebGPU 的方式写（TSL、计算着色器友好、绑定组 / 管线复用）。
@@ -146,6 +176,9 @@ viewer.addTileset({ source: { type: 'url', url: 'https://example.com/tileset.jso
 - 地形法线在瓦片边界用单侧差分，开启光照时可能看到细微接缝
 - 3D Tiles 的渐显（TilesFadePlugin）与影像叠加（ImageOverlayPlugin）依赖 `onBeforeCompile`，在 WebGPU 下不可用，暂未启用；点云（pnts）在 WebGPU 下为 1 像素点
 - 相机防入地只参考地形，不参考 3D Tiles 表面；隐藏地球（如加载 Google 3D Tiles）时以椭球面为准
+- 矢量按瓦片栅格化贴地：线宽是屏幕像素级的，但瓦片切换的过渡期内线条会短暂变虚；暂不支持面拉伸（3D 建筑）、沿线排布的注记和图标符号
+- 注记不会被 3D Tiles 建筑遮挡（只判断地平线和地形遮挡）
+- 示例国界为 Natural Earth 的“事实边界”，**不是审定地图**；在国内发布须使用审图号地图数据（如天地图边界）
 - 默认底图 / 地形服务仅用于开发演示，生产环境请使用自有服务或取得相应授权（OSM 瓦片使用政策、Esri 条款、天地图 key 等）
 
 ## 路线图
@@ -153,8 +186,8 @@ viewer.addTileset({ source: { type: 'url', url: 'https://example.com/tileset.jso
 **近期（v0.2）——数据与可用性**
 - 多影像图层（底图 + 注记 + 透明度），用纹理数组 / 图集替代单纹理
 - quantized-mesh 地形（Cesium World Terrain / 自建），地形与 3D Tiles 统一高程查询
-- 矢量数据：GeoJSON / MVT 贴地绘制，SDF 文字标注、图标
-- 要素拾取与属性查询（EXT_mesh_features / batch table），高亮
+- 矢量进阶：MVT 矢量瓦片、面拉伸（建筑白模）、沿线注记、图标符号、点聚合
+- 3D Tiles 要素拾取与属性查询（EXT_mesh_features / batch table），高亮
 - 跳级加载（skip-LOD）与基于帧预算的 GPU 上传
 
 **中期（v0.3）——深度用好 WebGPU**

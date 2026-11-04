@@ -19,7 +19,8 @@ import { Ellipsoid, cartographic, type Cartographic } from '../core/Ellipsoid';
 import { geodeticNormal, geodeticToEcef, isScaledSpacePointVisible, WGS84_A } from '../core/geodesy';
 import { clamp, wrapPi } from '../core/math';
 import { GlobeTile, SharedTexture } from './GlobeTile';
-import { createTileMaterial, type TileMaterial } from './TileMaterial';
+import { createTileMaterial, EMPTY_OVERLAY, type TileMaterial } from './TileMaterial';
+import type { TileOverlaySource } from './overlay';
 import { MERCATOR_MAX_LATITUDE, WebMercatorTilingScheme } from './TilingScheme';
 import { isAbortError, TileWorkerPool } from './TileWorkerPool';
 import type { ImageryProvider } from './imagery/ImageryProvider';
@@ -97,6 +98,8 @@ export class Globe {
   private imageryGen = 0;
   private geometryGen = 0;
   private placeholder: SharedTexture;
+  private overlaySource: TileOverlaySource | null = null;
+  private readonly emptyOverlay: SharedTexture;
 
   // Per-frame camera state.
   private readonly frustum = new Frustum();
@@ -126,6 +129,7 @@ export class Globe {
     placeholderTex.colorSpace = SRGBColorSpace;
     placeholderTex.needsUpdate = true;
     this.placeholder = new SharedTexture(placeholderTex, -1, 0, 0, 4).acquire();
+    this.emptyOverlay = new SharedTexture(EMPTY_OVERLAY, -1, 0, 0, 4).acquire();
 
     const n = this.scheme.tilesAtLevel(MIN_LEVEL);
     const lo = this.terrain ? TERRAIN_MIN_HEIGHT : 0;
@@ -161,6 +165,18 @@ export class Globe {
     this.capColors[0].clear();
     this.capColors[1].clear();
     this.abortAll();
+  }
+
+  /** Drapes a tile overlay source (e.g. rasterized vector layers) over the imagery. */
+  setOverlaySource(source: TileOverlaySource | null): void {
+    if (source === this.overlaySource) return;
+    this.overlaySource = source;
+    this.forEachTile((t) => {
+      t.ownOverlay?.release();
+      t.ownOverlay = null;
+      t.overlayGen = -1;
+      this.resolveOverlay(t);
+    });
   }
 
   setTerrain(source: TerrainSource | null, exaggeration = this.exaggeration): void {
@@ -209,6 +225,9 @@ export class Globe {
       if (t.mesh) t.mesh.visible = true;
       t.lastRenderedFrame = this.frame;
       if (!t.ownImagery || t.imageryGen !== this.imageryGen) this.resolveImagery(t);
+      if (this.overlaySource && (t.overlayGen !== this.overlaySource.version || t.overlay !== (t.ownOverlay ?? this.emptyOverlay))) {
+        this.resolveOverlay(t);
+      }
       maxLevel = Math.max(maxLevel, t.level);
     }
     this.prevRenderList = this.renderList;
@@ -267,7 +286,31 @@ export class Globe {
   }
 
   private isStale(tile: GlobeTile): boolean {
-    return !tile.mesh || tile.geometryGen !== this.geometryGen || !tile.imagery || tile.imageryGen !== this.imageryGen;
+    return (
+      !tile.mesh ||
+      tile.geometryGen !== this.geometryGen ||
+      !tile.imagery ||
+      tile.imageryGen !== this.imageryGen ||
+      this.overlayNeedsRequest(tile)
+    );
+  }
+
+  /**
+   * Whether the tile's overlay must be (re)requested. Tiles outside changed
+   * regions or without any content are brought up to date on the spot.
+   */
+  private overlayNeedsRequest(tile: GlobeTile): boolean {
+    const src = this.overlaySource;
+    if (!src || tile.overlayGen === src.version) return false;
+    if (tile.overlayGen >= 0 && src.isCurrent(tile.level, tile.x, tile.y, tile.overlayGen)) {
+      tile.overlayGen = src.version;
+      return false;
+    }
+    if (!src.hasContent(tile.level, tile.x, tile.y)) {
+      this.applyOverlay(tile, null, src.version);
+      return false;
+    }
+    return true;
   }
 
   private request(tile: GlobeTile, penalty = 0): void {
@@ -368,11 +411,23 @@ export class Globe {
         )
       : Promise.resolve(null);
     const imagery: Promise<SharedTexture | null | undefined> = needImagery ? this.loadImagery(tile, controller.signal) : Promise.resolve(undefined);
+    const overlaySource = this.overlaySource;
+    const overlayVersion = overlaySource?.version ?? -1;
+    const overlay: Promise<SharedTexture | null | undefined> =
+      overlaySource && this.overlayNeedsRequest(tile) ? this.loadOverlay(overlaySource, tile, controller.signal) : Promise.resolve(undefined);
 
-    void Promise.allSettled([geometry, imagery]).then(([g, i]) => {
+    void Promise.allSettled([geometry, imagery, overlay]).then(([g, i, o]) => {
       tile.loading = null;
       this.loadingTiles.delete(tile);
       const aborted = controller.signal.aborted;
+
+      if (o.status === 'fulfilled' && o.value !== undefined) {
+        if (!aborted && overlaySource === this.overlaySource) this.applyOverlay(tile, o.value, overlayVersion);
+        else o.value?.acquire().release();
+      } else if (o.status === 'rejected' && !aborted && !isAbortError(o.reason) && overlaySource === this.overlaySource) {
+        console.warn(`[Globe] overlay ${tile.key} failed:`, (o.reason as Error).message);
+        this.applyOverlay(tile, null, overlayVersion);
+      }
 
       if (i.status === 'fulfilled' && i.value !== undefined) {
         if (!aborted && imageryGen === this.imageryGen) this.applyImagery(tile, i.value, imageryGen);
@@ -428,6 +483,63 @@ export class Globe {
     texture.anisotropy = this.maxAnisotropy;
     texture.needsUpdate = true;
     return new SharedTexture(texture, tile.level, tile.x, tile.y, bitmap.width * bitmap.height * 4 * 1.33);
+  }
+
+  private async loadOverlay(source: TileOverlaySource, tile: GlobeTile, signal: AbortSignal): Promise<SharedTexture | null> {
+    const bitmap = await source.requestOverlay(tile.level, tile.x, tile.y, signal);
+    if (!bitmap) return null;
+    if (signal.aborted) {
+      bitmap.close();
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const texture = new Texture(bitmap);
+    texture.flipY = false;
+    texture.premultiplyAlpha = false;
+    texture.colorSpace = SRGBColorSpace;
+    texture.wrapS = texture.wrapT = ClampToEdgeWrapping;
+    texture.minFilter = LinearMipmapLinearFilter;
+    texture.magFilter = LinearFilter;
+    texture.generateMipmaps = true;
+    texture.anisotropy = this.maxAnisotropy;
+    texture.needsUpdate = true;
+    return new SharedTexture(texture, tile.level, tile.x, tile.y, bitmap.width * bitmap.height * 4 * 1.33);
+  }
+
+  private applyOverlay(tile: GlobeTile, texture: SharedTexture | null, version: number): void {
+    tile.ownOverlay?.release();
+    tile.ownOverlay = texture ? texture.acquire() : null;
+    tile.overlayGen = version;
+    this.resolveOverlay(tile);
+    this.trackLoaded(tile);
+  }
+
+  /** Own overlay, or while it is being refreshed, the closest ancestor's (magnified). */
+  private resolveOverlay(tile: GlobeTile): void {
+    const source = this.overlaySource;
+    let src: GlobeTile | null = null;
+    if (source) {
+      if (tile.ownOverlay) {
+        src = tile;
+      } else if (tile.overlayGen !== source.version) {
+        src = tile.parent;
+        while (src && !src.ownOverlay) src = src.parent;
+      }
+    }
+    const shared = src?.ownOverlay ?? this.emptyOverlay;
+    if (tile.overlay !== shared) {
+      shared.acquire();
+      tile.overlay?.release();
+      tile.overlay = shared;
+    }
+    const material = tile.material;
+    material.overlayMap = shared.texture;
+    if (src && src !== tile) {
+      const dz = tile.level - src.level;
+      const scale = 1 / 2 ** dz;
+      material.overlayTransform.set((tile.x - src.x * 2 ** dz) * scale, (tile.y - src.y * 2 ** dz) * scale, scale, scale);
+    } else {
+      material.overlayTransform.set(0, 0, 1, 1);
+    }
   }
 
   private applyImagery(tile: GlobeTile, texture: SharedTexture | null, gen: number): void {
@@ -515,7 +627,7 @@ export class Globe {
   }
 
   private trackLoaded(tile: GlobeTile): void {
-    if (tile.mesh || tile.ownImagery) this.loaded.add(tile);
+    if (tile.mesh || tile.ownImagery || tile.ownOverlay) this.loaded.add(tile);
   }
 
   // ---------------------------------------------------------------------------
@@ -536,7 +648,7 @@ export class Globe {
   private hasContentBelow(tile: GlobeTile): boolean {
     if (!tile.children) return false;
     for (const c of tile.children) {
-      if (c.mesh || c.ownImagery || c.imagery || c.loading || this.hasContentBelow(c)) return true;
+      if (c.mesh || c.ownImagery || c.imagery || c.ownOverlay || c.loading || this.hasContentBelow(c)) return true;
     }
     return false;
   }
@@ -552,6 +664,12 @@ export class Globe {
     tile.ownImagery = null;
     tile.imagery?.release();
     tile.imagery = null;
+    tile.ownOverlay?.release();
+    tile.ownOverlay = null;
+    tile.overlay?.release();
+    tile.overlay = null;
+    tile.overlayGen = -1;
+    tile.material.overlayMap = EMPTY_OVERLAY;
     tile.heights = null;
     tile.geometryGen = -1;
     tile.imageryGen = -1;
@@ -745,6 +863,7 @@ export class Globe {
     }
     for (const tex of this.capTextures) tex.dispose();
     this.placeholder.release();
+    this.emptyOverlay.release();
     this.workers.dispose();
     this.imagery.dispose?.();
   }

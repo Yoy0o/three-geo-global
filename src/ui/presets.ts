@@ -1,3 +1,5 @@
+import type { LabelStyle, VectorStyle } from '../vector/types';
+
 export interface Bookmark {
   name: string;
   /** Target on the ground: [lon deg, lat deg, height m]. */
@@ -61,5 +63,60 @@ export const TILESET_PRESETS: TilesetPreset[] = [
     kind: 'ion',
     assetId: 96188,
     note: '需要 Cesium ion access token',
+  },
+];
+
+export interface GeoJsonPreset {
+  id: string;
+  name: string;
+  url: string;
+  note?: string;
+  style?: Partial<VectorStyle>;
+  label?: Partial<LabelStyle>;
+}
+
+const NE = 'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson';
+
+/** Natural Earth (public domain) sample datasets; boundaries are de facto, for demonstration only. */
+export const GEOJSON_PRESETS: GeoJsonPreset[] = [
+  {
+    id: 'ne-countries',
+    name: '世界国家',
+    url: `${NE}/ne_110m_admin_0_countries.geojson`,
+    note: 'Natural Earth 1:1.1 亿国界（0.8 MB），按 MAPCOLOR7 分色，中文注记',
+    style: { colorBy: 'MAPCOLOR7', fillOpacity: 0.22, stroke: '#ffffff', strokeWidth: 1, strokeOpacity: 0.7 },
+    label: { size: 13 },
+  },
+  {
+    id: 'ne-admin1',
+    name: '省级行政区',
+    url: `${NE}/ne_50m_admin_1_states_provinces.geojson`,
+    note: 'Natural Earth 1:5000 万省级区划（部分国家，2.3 MB）',
+    style: { fillOpacity: 0, stroke: '#fda4af', strokeWidth: 1, strokeOpacity: 0.85 },
+    label: { size: 12, color: '#ffe4e6' },
+  },
+  {
+    id: 'ne-places',
+    name: '世界城市',
+    url: `${NE}/ne_110m_populated_places.geojson`,
+    note: 'Natural Earth 人口聚居地（点 + 注记，按 LABELRANK 避让）',
+    style: { pointColor: '#fbbf24', pointRadius: 3.5 },
+    label: { size: 12.5 },
+  },
+  {
+    id: 'ne-rivers',
+    name: '主要河流',
+    url: `${NE}/ne_50m_rivers_lake_centerlines.geojson`,
+    note: 'Natural Earth 河流与湖泊中心线（线 + 注记）',
+    style: { stroke: '#7dd3fc', strokeWidth: 1.4, strokeOpacity: 0.95 },
+    label: { size: 12, color: '#e0f2fe' },
+  },
+  {
+    id: 'ne-countries-chn',
+    name: '国界（中国视角 10m）',
+    url: `${NE}/ne_10m_admin_0_countries_chn.geojson`,
+    note: 'Natural Earth 中国视角 1:1000 万国界（13 MB，加载较慢）；非审定地图，仅供演示',
+    style: { fillOpacity: 0, stroke: '#facc15', strokeWidth: 1.2, strokeOpacity: 0.9 },
+    label: { size: 13 },
   },
 ];
