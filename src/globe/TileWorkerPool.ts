@@ -1,3 +1,4 @@
+import type { TerrainSource } from './terrain/TerrainSource';
 import type { BuildTileRequest, BuiltTile, WorkerResponse } from './workerProtocol';
 
 interface PendingJob {
@@ -29,6 +30,7 @@ export class TileWorkerPool {
   private load: number[] = [];
   private jobs = new Map<number, PendingJob>();
   private nextId = 1;
+  private readonly registered = new WeakSet<TerrainSource>();
 
   constructor(size = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1))) {
     for (let i = 0; i < size; i++) {
@@ -42,6 +44,13 @@ export class TileWorkerPool {
 
   get size(): number {
     return this.workers.length;
+  }
+
+  /** Sends a terrain source description to every worker once (requests then refer to it by id). */
+  registerTerrain(source: TerrainSource): void {
+    if (this.registered.has(source)) return;
+    this.registered.add(source);
+    for (const w of this.workers) w.postMessage({ type: 'source', source });
   }
 
   /**

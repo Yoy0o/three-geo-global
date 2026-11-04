@@ -10,6 +10,8 @@ export interface ImageryProvider {
   readonly maxZoom: number;
   readonly attribution: string;
   requestImage(level: number, x: number, y: number, signal: AbortSignal): Promise<ImageBitmap | null>;
+  /** Raw encoded tile, when the provider can supply it (lets callers cache compressed bytes). */
+  requestBlob?(level: number, x: number, y: number, signal?: AbortSignal): Promise<Blob | null>;
   dispose?(): void;
 }
 
@@ -67,12 +69,16 @@ export class XYZImageryProvider implements ImageryProvider {
     return url;
   }
 
-  async requestImage(level: number, x: number, y: number, signal: AbortSignal): Promise<ImageBitmap | null> {
+  async requestBlob(level: number, x: number, y: number, signal?: AbortSignal): Promise<Blob | null> {
     const res = await fetch(this.tileUrl(level, x, y), { signal, mode: 'cors', credentials: 'omit' });
     if (res.status === 404 || res.status === 204) return null;
     if (!res.ok) throw new Error(`imagery HTTP ${res.status}`);
     const blob = await res.blob();
-    if (blob.size === 0) return null;
-    return decodeImage(blob);
+    return blob.size === 0 ? null : blob;
+  }
+
+  async requestImage(level: number, x: number, y: number, signal: AbortSignal): Promise<ImageBitmap | null> {
+    const blob = await this.requestBlob(level, x, y, signal);
+    return blob ? decodeImage(blob) : null;
   }
 }

@@ -8,7 +8,8 @@ export interface BuildTileRequest {
   y: number;
   /** Grid cells per tile edge. */
   segments: number;
-  terrain: TerrainSource | null;
+  /** Id of a terrain source previously registered with a `source` message. */
+  terrainId: string | null;
   exaggeration: number;
   /** Clamp bathymetry to sea level so oceans stay flat under imagery. */
   clampToSeaLevel: boolean;
@@ -19,7 +20,12 @@ export interface CancelRequest {
   id: number;
 }
 
-export type WorkerRequest = BuildTileRequest | CancelRequest;
+export interface SourceRequest {
+  type: 'source';
+  source: TerrainSource;
+}
+
+export type WorkerRequest = BuildTileRequest | CancelRequest | SourceRequest;
 
 export interface BuiltTile {
   type: 'built';

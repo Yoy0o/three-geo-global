@@ -43,7 +43,7 @@ async function main(): Promise<void> {
   const settings = loadSettings();
   const imageryParam = params.get('imagery');
   if (imageryParam) settings.imagery = imageryParam;
-  if (params.has('noterrain')) settings.terrain = false;
+  if (params.has('noterrain')) settings.terrainSource = 'none';
 
   const splash = h('div', { class: 'splash' }, h('div', { class: 'splash-globe' }), h('span', {}, '正在初始化 GPU…'));
   app.append(splash);
@@ -53,7 +53,8 @@ async function main(): Promise<void> {
     viewer = await GeoViewer.create({
       container,
       imagery: createImagery(settings),
-      terrain: settings.terrain ? AWS_TERRARIUM : null,
+      // Sources that need network setup (Cesium ion, layer.json) are applied once the panel exists.
+      terrain: settings.terrainSource === 'aws' ? AWS_TERRARIUM : null,
       terrainExaggeration: settings.exaggeration,
       maxScreenSpaceError: settings.quality,
       forceWebGL: params.has('webgl'),
@@ -72,6 +73,7 @@ async function main(): Promise<void> {
   viewer.showStars = settings.stars;
 
   const panel = new ControlPanel(viewer, settings);
+  if (settings.terrainSource !== 'aws' && settings.terrainSource !== 'none') void panel.applyTerrain();
   const status = new StatusBar(viewer);
   const title = h(
     'div',

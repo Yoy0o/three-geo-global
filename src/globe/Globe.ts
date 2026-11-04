@@ -24,7 +24,7 @@ import type { TileOverlaySource } from './overlay';
 import { MERCATOR_MAX_LATITUDE, WebMercatorTilingScheme } from './TilingScheme';
 import { isAbortError, TileWorkerPool } from './TileWorkerPool';
 import type { ImageryProvider } from './imagery/ImageryProvider';
-import type { TerrainSource } from './terrain/TerrainSource';
+import { isQuantizedMesh, type TerrainSource } from './terrain/TerrainSource';
 import type { BuiltTile } from './workerProtocol';
 
 export interface GlobeOptions {
@@ -63,6 +63,18 @@ const _a = new Vector3();
 const _b = new Vector3();
 const _c = new Vector3();
 const _hit = new Vector3();
+
+/** Routes tiles that share cached source data (same terrain ancestor / column) to the same worker. */
+function terrainAffinity(terrain: TerrainSource, tile: GlobeTile): string | undefined {
+  if (isQuantizedMesh(terrain)) {
+    const g = Math.max(0, Math.min(terrain.geographicMaxZoom, tile.level - 1));
+    const shift = tile.level - 1 - g;
+    return shift > 0 ? `qm:${g}/${tile.x >> shift}` : undefined;
+  }
+  if (tile.level <= terrain.maxZoom) return undefined;
+  const dz = tile.level - terrain.maxZoom;
+  return `${dz}:${tile.x >> dz}/${tile.y >> dz}`;
+}
 
 export class Globe {
   readonly group = new Group();
@@ -393,6 +405,7 @@ export class Globe {
     const needImagery = !tile.imagery || tile.imageryGen !== imageryGen;
     const terrain = this.terrain;
 
+    if (terrain && needGeometry) this.workers.registerTerrain(terrain);
     const geometry: Promise<BuiltTile | null> = needGeometry
       ? this.workers.build(
           {
@@ -400,14 +413,12 @@ export class Globe {
             x: tile.x,
             y: tile.y,
             segments: this.segments,
-            terrain,
+            terrainId: terrain?.id ?? null,
             exaggeration: this.exaggeration,
             clampToSeaLevel: true,
           },
           controller.signal,
-          terrain && tile.level > terrain.maxZoom
-            ? `${tile.level - terrain.maxZoom}:${tile.x >> (tile.level - terrain.maxZoom)}/${tile.y >> (tile.level - terrain.maxZoom)}`
-            : undefined,
+          terrain ? terrainAffinity(terrain, tile) : undefined,
         )
       : Promise.resolve(null);
     const imagery: Promise<SharedTexture | null | undefined> = needImagery ? this.loadImagery(tile, controller.signal) : Promise.resolve(undefined);

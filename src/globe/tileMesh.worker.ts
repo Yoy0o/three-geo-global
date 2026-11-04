@@ -6,7 +6,8 @@
 import { computeHorizonCullingPoint, geodeticNormal, geodeticToEcef, mercatorVToLatitude, WGS84_A } from '../core/geodesy';
 import { geoidUndulation } from '../core/Geoid';
 import type { BuildTileRequest, BuiltTile, WorkerRequest, WorkerResponse } from './workerProtocol';
-import type { TerrainSource } from './terrain/TerrainSource';
+import { isQuantizedMesh, type QuantizedMeshTerrainSource, type RasterTerrainSource, type TerrainSource } from './terrain/TerrainSource';
+import { decodeQuantizedMesh, geographicTileRect, isTileAvailable, rasterizeQuantizedMesh, sampleGrid } from './terrain/quantizedMesh';
 
 // Minimal worker scope typing (the project compiles against the DOM lib).
 declare const self: {
@@ -24,12 +25,13 @@ const HEIGHT_CACHE_SIZE = 64;
 const heightCache = new Map<string, Promise<HeightImage>>();
 const pending = new Set<number>();
 const cancelled = new Set<number>();
+const sources = new Map<string, TerrainSource>();
 
 function fillTemplate(url: string, z: number, x: number, y: number): string {
   return url.replace('{z}', String(z)).replace('{x}', String(x)).replace('{y}', String(y));
 }
 
-async function fetchHeightImage(src: TerrainSource, z: number, x: number, y: number): Promise<HeightImage> {
+async function fetchHeightImage(src: RasterTerrainSource, z: number, x: number, y: number): Promise<HeightImage> {
   const res = await fetch(fillTemplate(src.url, z, x, y), { mode: 'cors', credentials: 'omit' });
   if (!res.ok) throw new Error(`terrain HTTP ${res.status}`);
   const blob = await res.blob();
@@ -55,7 +57,7 @@ async function fetchHeightImage(src: TerrainSource, z: number, x: number, y: num
   return { width, height, data };
 }
 
-function getHeightImage(src: TerrainSource, z: number, x: number, y: number): Promise<HeightImage> {
+function getHeightImage(src: RasterTerrainSource, z: number, x: number, y: number): Promise<HeightImage> {
   const key = `${src.id}/${z}/${x}/${y}`;
   let entry = heightCache.get(key);
   if (entry) {
@@ -91,7 +93,7 @@ function sampleHeight(img: HeightImage, u: number, v: number): number {
   return a * (1 - ty) + b * ty;
 }
 
-async function sampleTerrainGrid(req: BuildTileRequest, src: TerrainSource): Promise<Float32Array> {
+async function sampleTerrainGrid(req: BuildTileRequest, src: RasterTerrainSource): Promise<Float32Array> {
   const N = req.segments;
   const { level, x, y } = req;
   // Tiles deeper than the source's max zoom sample a sub-rectangle of their ancestor.
@@ -117,7 +119,93 @@ async function sampleTerrainGrid(req: BuildTileRequest, src: TerrainSource): Pro
   return heights;
 }
 
-function buildMesh(req: BuildTileRequest, heights: Float32Array | null): BuiltTile {
+// -----------------------------------------------------------------------------
+// Quantized-mesh terrain (geographic tiles resampled onto the mercator grid)
+
+const QM_GRID = 65;
+
+interface GeoTile {
+  level: number;
+  x: number;
+  y: number;
+  grid: Float32Array;
+}
+
+const geoCache = new Map<string, Promise<GeoTile | null>>();
+
+/** Loads a geographic terrain tile, falling back to ancestors when it is not available. */
+function loadGeoTile(src: QuantizedMeshTerrainSource, level: number, x: number, y: number): Promise<GeoTile | null> {
+  const key = `${src.id}/${level}/${x}/${y}`;
+  let entry = geoCache.get(key);
+  if (entry) {
+    geoCache.delete(key);
+    geoCache.set(key, entry);
+    return entry;
+  }
+  entry = (async (): Promise<GeoTile | null> => {
+    const parent = () => (level > 0 ? loadGeoTile(src, level - 1, x >> 1, y >> 1) : Promise.resolve(null));
+    if (!isTileAvailable(src.available, level, x, y)) return parent();
+    const res = await fetch(fillTemplate(src.url, level, x, y), { headers: src.headers, mode: 'cors', credentials: 'omit' });
+    if (res.status === 404 || res.status === 204) return parent();
+    if (!res.ok) throw new Error(`terrain HTTP ${res.status}`);
+    const tile = decodeQuantizedMesh(await res.arrayBuffer());
+    return { level, x, y, grid: rasterizeQuantizedMesh(tile, QM_GRID) };
+  })();
+  geoCache.set(key, entry);
+  entry.catch(() => geoCache.delete(key));
+  while (geoCache.size > HEIGHT_CACHE_SIZE) geoCache.delete(geoCache.keys().next().value as string);
+  return entry;
+}
+
+async function sampleQuantizedMesh(req: BuildTileRequest, src: QuantizedMeshTerrainSource): Promise<Float32Array> {
+  const N = req.segments;
+  const row = N + 1;
+  const n = 2 ** req.level;
+  const west = (req.x / n) * 360 - 180;
+  const east = ((req.x + 1) / n) * 360 - 180;
+  const vNorth = req.y / n;
+  const vSouth = (req.y + 1) / n;
+  const toDeg = 180 / Math.PI;
+  const latN = mercatorVToLatitude(vNorth) * toDeg;
+  const latS = mercatorVToLatitude(vSouth) * toDeg;
+
+  // A geographic tile at level g is as wide as a mercator tile at level g + 1,
+  // so one column covers this tile; it spans at most a couple of rows.
+  const g = Math.max(0, Math.min(src.geographicMaxZoom, req.level - 1));
+  const size = 180 / 2 ** g;
+  const gx = Math.min(2 ** (g + 1) - 1, Math.max(0, Math.floor((west + 180) / size + 1e-9)));
+  const maxRow = 2 ** g - 1;
+  const rowOf = (lat: number) => Math.min(maxRow, Math.max(0, Math.floor((lat + 90) / size)));
+  const r0 = rowOf(latS);
+  const r1 = rowOf(latN - 1e-9);
+  const tiles = new Map<number, GeoTile | null>();
+  await Promise.all(
+    Array.from({ length: r1 - r0 + 1 }, (_, i) => r0 + i).map(async (r) => tiles.set(r, await loadGeoTile(src, g, gx, r))),
+  );
+
+  const heights = new Float32Array(row * row);
+  for (let j = 0; j <= N; j++) {
+    const lat = mercatorVToLatitude(vNorth + ((vSouth - vNorth) * j) / N) * toDeg;
+    const tile = tiles.get(Math.min(r1, Math.max(r0, rowOf(lat))));
+    for (let i = 0; i <= N; i++) {
+      const lon = west + ((east - west) * i) / N;
+      let h = 0;
+      if (tile) {
+        const rect = geographicTileRect(tile.level, tile.x, tile.y);
+        h = sampleGrid(tile.grid, QM_GRID, (lon - rect.west) / rect.size, (lat - rect.south) / rect.size);
+      }
+      if (req.exaggeration !== 1) {
+        // Exaggerate relative to sea level, not to the ellipsoid.
+        const n0 = geoidUndulation(lon / toDeg, lat / toDeg);
+        h = (h - n0) * req.exaggeration + n0;
+      }
+      heights[j * row + i] = h;
+    }
+  }
+  return heights;
+}
+
+function buildMesh(req: BuildTileRequest, heights: Float32Array | null, src: TerrainSource | null): BuiltTile {
   const N = req.segments;
   const row = N + 1;
   const gridCount = row * row;
@@ -133,7 +221,7 @@ function buildMesh(req: BuildTileRequest, heights: Float32Array | null): BuiltTi
   for (let j = 0; j <= N; j++) lats[j] = mercatorVToLatitude(vNorth + ((vSouth - vNorth) * j) / N);
 
   // MSL -> ellipsoidal heights (EGM96), so terrain and 3D Tiles share one datum.
-  if (heights && req.terrain?.heightReference === 'msl') {
+  if (heights && src?.heightReference === 'msl') {
     for (let j = 0; j <= N; j++) {
       for (let i = 0; i <= N; i++) {
         heights[j * row + i] += geoidUndulation(west + ((east - west) * i) / N, lats[j]);
@@ -317,12 +405,14 @@ function buildMesh(req: BuildTileRequest, heights: Float32Array | null): BuiltTi
 async function handleBuild(req: BuildTileRequest): Promise<void> {
   pending.add(req.id);
   try {
-    const heights = req.terrain ? await sampleTerrainGrid(req, req.terrain) : null;
+    const src = req.terrainId ? (sources.get(req.terrainId) ?? null) : null;
+    if (req.terrainId && !src) throw new Error(`unknown terrain source ${req.terrainId}`);
+    const heights = src ? await (isQuantizedMesh(src) ? sampleQuantizedMesh(req, src) : sampleTerrainGrid(req, src)) : null;
     if (cancelled.delete(req.id)) {
       post({ type: 'error', id: req.id, message: 'cancelled', aborted: true });
       return;
     }
-    const tile = buildMesh(req, heights);
+    const tile = buildMesh(req, heights, src);
     const transfer: Transferable[] = [tile.positions.buffer, tile.normals.buffer, tile.uvs.buffer, tile.indices.buffer];
     if (tile.heights) transfer.push(tile.heights.buffer);
     post(tile, transfer);
@@ -341,6 +431,7 @@ function post(msg: WorkerResponse, transfer: Transferable[] = []): void {
 
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const msg = event.data;
-  if (msg.type === 'build') void handleBuild(msg);
+  if (msg.type === 'source') sources.set(msg.source.id, msg.source);
+  else if (msg.type === 'build') void handleBuild(msg);
   else if (msg.type === 'cancel' && pending.has(msg.id)) cancelled.add(msg.id);
 };
