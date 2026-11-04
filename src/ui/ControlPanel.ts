@@ -10,6 +10,7 @@ import type { GeoViewer } from '../viewer/GeoViewer';
 import { h, section, slider, toggle } from './dom';
 import { BOOKMARKS, TILESET_PRESETS, type Bookmark } from './presets';
 import { saveSettings, type Settings } from './settings';
+import { VectorPanel } from './VectorPanel';
 
 /** Builds an imagery provider from saved settings (shared with startup). */
 export function createImagery(settings: Settings): ImageryProvider {
@@ -23,6 +24,7 @@ export function createImagery(settings: Settings): ImageryProvider {
 
 export class ControlPanel {
   readonly root: HTMLElement;
+  readonly vectorPanel: VectorPanel;
   private readonly layerList = h('div', { class: 'layer-list' });
   private readonly message = h('div', { class: 'panel-message', role: 'status' });
 
@@ -31,11 +33,13 @@ export class ControlPanel {
     private readonly settings: Settings,
   ) {
     const collapse = h('button', { class: 'panel-toggle', title: '收起 / 展开面板', 'aria-label': '收起或展开面板' }, '☰');
+    this.vectorPanel = new VectorPanel(viewer, (text, kind) => this.notify(text, kind));
     const body = h(
       'div',
       { class: 'panel-body' },
       this.basemapSection(),
       this.terrainSection(),
+      this.vectorPanel.root,
       this.sceneSection(),
       this.tilesSection(),
       this.bookmarkSection(),

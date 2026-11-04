@@ -23,6 +23,11 @@ import { clamp, DEG2RAD, smoothstep } from '../core/math';
 import { greenwichMeanSiderealTime, sunDirectionECEF } from '../core/SunPosition';
 import { Globe, type GlobeOptions } from '../globe/Globe';
 import { Tiles3DLayer, type LoaderKit, type Tiles3DLayerOptions } from '../tiles3d/Tiles3DLayer';
+import { GeoJsonLayer, type GeoJsonLayerOptions } from '../vector/GeoJsonLayer';
+import { lonLatToMerc } from '../vector/geometry';
+import { LabelManager } from '../vector/LabelManager';
+import type { FeatureHit } from '../vector/types';
+import { VectorService } from '../vector/VectorService';
 import { cameraDirection, getHeadingPitch, lookAtHeadingPitchRange } from './cameraMath';
 import { GlobeCameraController, type ControllerHost } from './GlobeCameraController';
 
@@ -67,7 +72,17 @@ export interface FrameStats {
 export interface ViewerEvents extends Record<string, unknown> {
   frame: FrameStats;
   'tilesets-changed': Tiles3DLayer[];
+  'vectors-changed': GeoJsonLayer[];
 }
+
+export interface FeaturePick {
+  hit: FeatureHit;
+  layer: GeoJsonLayer;
+  /** Picked ground position (radians / meters), null when picked through a label. */
+  position: Cartographic | null;
+}
+
+const EARTH_CIRCUMFERENCE = 2 * Math.PI * 6378137;
 
 const _ndc = new Vector2();
 const _v = new Vector3();
@@ -95,6 +110,10 @@ export class GeoViewer {
   readonly info: RendererInfo;
   readonly stats: FrameStats = { fps: 0, frameMs: 0, gpuMs: null, drawCalls: 0, triangles: 0 };
   readonly tilesets: Tiles3DLayer[] = [];
+  /** Worker-backed vector pipeline (draped rasterization, queries). */
+  readonly vectors = new VectorService();
+  readonly labels: LabelManager;
+  readonly vectorLayers: GeoJsonLayer[] = [];
 
   /** Simulated date driving the sun and star positions. */
   date = new Date();
@@ -156,7 +175,11 @@ export class GeoViewer {
     this.camera.name = 'GlobeCamera';
 
     this.globe = new Globe(options);
+    this.globe.setOverlaySource(this.vectors);
     this.scene.add(this.globe.group);
+    this.labels = new LabelManager(this.ellipsoid);
+    this.labels.heightProvider = (lon, lat) => (this._showGlobe ? this.globe.getHeight(lon, lat) : 0);
+    this.scene.add(this.labels.group);
     this.scene.add(this.stars.mesh);
     this.scene.add(this.sunLight, this.sunLight.target, this.skyLight);
     this.scene.background = new Color(0x000000);
@@ -322,6 +345,72 @@ export class GeoViewer {
     this.events.emit('tilesets-changed', this.tilesets);
   }
 
+  // ---------------------------------------------------------------------------
+  // GeoJSON / vector layers
+
+  addGeoJson(options: GeoJsonLayerOptions): GeoJsonLayer {
+    const layer = new GeoJsonLayer(options, this.vectors, this.labels);
+    this.vectorLayers.push(layer);
+    layer.events.on('ready', () => this.events.emit('vectors-changed', this.vectorLayers));
+    this.events.emit('vectors-changed', this.vectorLayers);
+    return layer;
+  }
+
+  removeGeoJson(layer: GeoJsonLayer): void {
+    const i = this.vectorLayers.indexOf(layer);
+    if (i < 0) return;
+    this.vectorLayers.splice(i, 1);
+    layer.dispose();
+    this.events.emit('vectors-changed', this.vectorLayers);
+  }
+
+  /** Flies to fit a [west, south, east, north] box in degrees (top-down view). */
+  flyToBBox(bbox: [number, number, number, number], duration?: number): Promise<void> {
+    const [w, s, e, n] = bbox;
+    let lon = (w + e) / 2;
+    lon = ((((lon + 180) % 360) + 360) % 360) - 180;
+    const lat = Math.max(-80, Math.min(80, (s + n) / 2));
+    const widthM = Math.abs(e - w) * 111_320 * Math.cos(lat * DEG2RAD);
+    const heightM = Math.abs(n - s) * 110_540;
+    const fov = this.camera.getEffectiveFOV() * DEG2RAD;
+    const fit = Math.max(heightM, widthM / Math.max(this.camera.aspect, 0.5), 1500);
+    const height = Math.min((fit / (2 * Math.tan(fov / 2))) * 1.25, 2.2e7);
+    return this.flyTo({ longitude: lon, latitude: lat, height, heading: 0, pitch: -90 }, duration);
+  }
+
+  /**
+   * Vector feature under a client-space pixel: labels first, then draped
+   * geometry at the picked ground position.
+   */
+  async pickFeature(clientX: number, clientY: number): Promise<FeaturePick | null> {
+    if (this.vectorLayers.length === 0) return null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    let hit: FeatureHit | null = null;
+    let position: Cartographic | null = null;
+    const label = this.labels.hitTest(clientX - rect.left, clientY - rect.top);
+    if (label) hit = await this.vectors.getFeature(label.layerId, label.featureId);
+    if (!hit) {
+      _ndc.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+      const p = this.pick(_ndc);
+      if (!p) return null;
+      position = this.ellipsoid.cartesianToCartographic(p.point);
+      if (!position) return null;
+      const [u, v] = lonLatToMerc(position.longitude / DEG2RAD, position.latitude / DEG2RAD);
+      const sse = rect.height / (2 * Math.tan((this.camera.getEffectiveFOV() * DEG2RAD) / 2));
+      const metersPerPx = this.camera.position.distanceTo(p.point) / sse;
+      const pixelSize = metersPerPx / (EARTH_CIRCUMFERENCE * Math.max(Math.cos(position.latitude), 0.01));
+      hit = await this.vectors.query(u, v, pixelSize, 5);
+    }
+    if (!hit) return null;
+    const layer = this.vectorLayers.find((l) => l.id === hit.layerId);
+    return layer ? { hit, layer, position } : null;
+  }
+
+  /** Highlights a picked feature (null clears). */
+  highlightFeature(hit: FeatureHit | null): void {
+    this.vectors.setHighlight(hit);
+  }
+
   private getLoaders(): LoaderKit {
     if (!this.loaders) {
       // Decoder binaries ship with three.js and are bundled by Vite (default paths).
@@ -361,6 +450,7 @@ export class GeoViewer {
     const t0 = performance.now();
     if (this._showGlobe) this.globe.update(this.camera, this.container.clientHeight);
     for (const layer of this.tilesets) layer.update();
+    this.labels.update(this.camera, this.container.clientWidth, this.container.clientHeight, dt);
 
     this.renderer.render(this.scene, this.camera);
     this.updateStats(dt, performance.now() - t0);
@@ -465,6 +555,9 @@ export class GeoViewer {
     this.resizeObserver.disconnect();
     this.controller.dispose();
     for (const layer of [...this.tilesets]) this.removeTileset(layer);
+    for (const layer of [...this.vectorLayers]) this.removeGeoJson(layer);
+    this.labels.dispose();
+    this.vectors.dispose();
     this.globe.dispose();
     this.renderer.dispose();
     this.renderer.domElement.remove();

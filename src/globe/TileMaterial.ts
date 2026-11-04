@@ -1,4 +1,4 @@
-import { Texture, Vector4 } from 'three';
+import { DataTexture, SRGBColorSpace, Texture, Vector4 } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
   dot,
@@ -34,8 +34,16 @@ export interface TileMaterial extends MeshBasicNodeMaterial {
   imageryMap: Texture;
   /** (offsetU, offsetV, scaleU, scaleV) into `imageryMap` (magnified ancestor fallback). */
   imageryTransform: Vector4;
+  /** Transparent overlay drawn over the imagery (rasterized vector layers). */
+  overlayMap: Texture;
+  overlayTransform: Vector4;
   tileLevel: number;
 }
+
+/** 1x1 fully transparent texture used when a tile has no overlay. */
+export const EMPTY_OVERLAY = new DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
+EMPTY_OVERLAY.colorSpace = SRGBColorSpace;
+EMPTY_OVERLAY.needsUpdate = true;
 
 export const tileDebugUniforms = {
   showTileBorders: uniform(0).setGroup(renderGroup),
@@ -100,9 +108,14 @@ function sharedNodes(): SharedNodes {
 
   const imageryUV = uv().mul(imageryTransform.zw).add(imageryTransform.xy);
   const imagery: TSLNode = (materialReference('imageryMap', 'texture') as TSLNode).context({ getUV: () => imageryUV });
+  const overlayTransform: TSLNode = materialReference('overlayTransform', 'vec4');
+  const overlayUV = uv().mul(overlayTransform.zw).add(overlayTransform.xy);
+  const overlay: TSLNode = (materialReference('overlayMap', 'texture') as TSLNode).context({ getUV: () => overlayUV });
 
   const colorNode = Fn(() => {
     const albedo = vec3(imagery.rgb).toVar();
+    // Draped overlays (vectors) sit on the ground, so they are lit and hazed like it.
+    albedo.assign(mix(albedo, overlay.rgb, overlay.a));
 
     // Debug overlays.
     If(tileDebugUniforms.levelTint.greaterThan(0.5), () => {
@@ -138,6 +151,8 @@ export function createTileMaterial(texture: Texture = placeholder, level = 0): T
   material.name = 'GlobeTile';
   material.imageryMap = texture;
   material.imageryTransform = new Vector4(0, 0, 1, 1);
+  material.overlayMap = EMPTY_OVERLAY;
+  material.overlayTransform = new Vector4(0, 0, 1, 1);
   material.tileLevel = level;
   const nodes = sharedNodes();
   material.positionNode = nodes.positionNode;
