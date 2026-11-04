@@ -27,6 +27,11 @@ export class CameraFlight {
   private readonly pitch0: number;
   private readonly pitch1: number;
   private readonly tmpN = new Vector3();
+  /**
+   * Shift applied to the destination, blended in with the flight's progress
+   * (the target moved while flying, e.g. a building settling onto the terrain).
+   */
+  readonly endOffset = new Vector3();
 
   constructor(
     private readonly ellipsoid: Ellipsoid,
@@ -79,6 +84,7 @@ export class CameraFlight {
     const bump = Math.sin(Math.PI * t);
     const height = Math.exp(lerp(this.logH0, this.logH1, e) + this.arc * bump);
     this.ellipsoid.cartographicToCartesian(lon, lat, height, outPosition);
+    if (this.endOffset.lengthSq() > 0) outPosition.addScaledVector(this.endOffset, e);
 
     // Look down while high up in the arc.
     const lookDown = Math.min(1, this.arc / 2) * bump;

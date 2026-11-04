@@ -49,8 +49,20 @@ export class Ellipsoid {
     this.minimumRadius = Math.min(x, y, z);
   }
 
+  /**
+   * Normal of the ellipsoid surface at a point ON the surface. For points
+   * above it this is the normal of a scaled ellipsoid through the point, which
+   * drifts from the true vertical with height (0.4° at 17,000 km); use
+   * {@link geodeticNormal} for camera positions.
+   */
   geodeticSurfaceNormal(cartesian: Vector3, result = new Vector3()): Vector3 {
     return result.copy(cartesian).multiply(this.oneOverRadiiSquared).normalize();
+  }
+
+  /** True geodetic vertical (normal of the surface point below) at any position. */
+  geodeticNormal(cartesian: Vector3, result = new Vector3()): Vector3 {
+    const p = this.scaleToGeodeticSurface(cartesian, _p);
+    return this.geodeticSurfaceNormal(p ?? cartesian, result);
   }
 
   geodeticSurfaceNormalCartographic(longitude: number, latitude: number, result = new Vector3()): Vector3 {
@@ -135,17 +147,13 @@ export class Ellipsoid {
 
   /** Local east-north-up frame at `origin` (columns: east, north, up, origin). */
   eastNorthUpToFixedFrame(origin: Vector3, result = new Matrix4()): Matrix4 {
-    this.geodeticSurfaceNormal(origin, _up);
-    _east.set(-origin.y, origin.x, 0);
-    if (_east.lengthSq() < 1e-20) _east.set(0, 1, 0);
-    _east.normalize();
-    _north.crossVectors(_up, _east);
+    this.eastNorthUp(origin, _east, _north, _up);
     return result.makeBasis(_east, _north, _up).setPosition(origin);
   }
 
-  /** East / north / up unit vectors at an ECEF position. */
+  /** East / north / up unit vectors at an ECEF position (true geodetic vertical at any height). */
   eastNorthUp(position: Vector3, east: Vector3, north: Vector3, up: Vector3): void {
-    this.geodeticSurfaceNormal(position, up);
+    this.geodeticNormal(position, up);
     east.set(-position.y, position.x, 0);
     if (east.lengthSq() < 1e-20) east.set(0, 1, 0);
     east.normalize();

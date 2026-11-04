@@ -1,25 +1,65 @@
 import { PerspectiveCamera, Quaternion, Ray, Vector2, Vector3 } from 'three';
 import { cartographic, type Ellipsoid } from '../core/Ellipsoid';
-import { clamp } from '../core/math';
+import { EventEmitter } from '../core/EventEmitter';
+import { clamp, DEG2RAD } from '../core/math';
 import { CameraFlight, type FlightTarget } from './CameraFlight';
-import { getHeadingPitch, levelOrientation, orientationFromHeadingPitch } from './cameraMath';
+import {
+  getHeadingPitch,
+  intersectSphere,
+  orbitAround,
+  orientationFromHeadingPitch,
+  rayFromNdc,
+  rotateCameraAboutCenter,
+  zoomTowards,
+} from './cameraMath';
 
 export interface ControllerHost {
   readonly camera: PerspectiveCamera;
   readonly ellipsoid: Ellipsoid;
   readonly domElement: HTMLElement;
-  /** World position of the surface (globe or 3D Tiles) under a point in NDC, or null. */
+  /** World position of the surface (globe, 3D Tiles or scene objects) under a point in NDC, or null. */
   pick(ndc: Vector2): Vector3 | null;
-  /** Ground height in meters at a position, 0 when unknown. */
-  groundHeight(longitude: number, latitude: number): number;
+  /**
+   * Ground height in meters for collision, or null while it is unknown or only
+   * a coarse estimate (the camera is then not pushed up).
+   */
+  groundHeight(longitude: number, latitude: number): number | null;
 }
 
-type DragMode = 'none' | 'rotate' | 'orbit' | 'look' | 'touch';
+export interface ControllerEvents extends Record<string, unknown> {
+  /** A user gesture (drag, wheel, key, touch) started; animations were cancelled. */
+  interactionstart: void;
+  /** The camera moved this frame. */
+  change: void;
+}
+
+export interface AutoOrbitOptions {
+  /** Point to orbit around (defaults to the surface point at the screen center). */
+  pivot?: Vector3;
+  /** Heading change per second in degrees (positive turns clockwise as seen from above). */
+  degreesPerSecond?: number;
+  /** Stop after turning this many degrees (default: keep orbiting until interrupted). */
+  totalDegrees?: number;
+}
+
+type DragMode = 'none' | 'pan' | 'orbit' | 'look' | 'touch';
 
 interface Sample {
   time: number;
   axis: Vector3;
   angle: number;
+}
+
+interface OrbitAnimation {
+  pivot: Vector3;
+  /** Total heading change (radians), Infinity for an endless orbit. */
+  total: number;
+  applied: number;
+  /** Eased animation duration; 0 for constant speed. */
+  duration: number;
+  speed: number;
+  elapsed: number;
+  done?: () => void;
 }
 
 const _ray = new Ray();
@@ -28,25 +68,55 @@ const _v = new Vector3();
 const _w = new Vector3();
 const _up = new Vector3();
 const _axis = new Vector3();
+const _prevPos = new Vector3();
+const _prevQ = new Quaternion();
+const _ndc = new Vector2();
 const _carto = cartographic();
+const CENTER = new Vector2(0, 0);
 
 /**
- * Google-Earth-style globe navigation:
- * - left drag: grab and spin the globe (point under the cursor stays under it)
- * - wheel / pinch: zoom towards the cursor
- * - right / middle drag, or Ctrl/Shift + left drag: orbit (heading + tilt) around the point under the cursor
- * - double click: fly closer to a point
+ * Globe navigation (Google Earth / Mapbox style):
+ * - left drag: grab and spin the globe (the point under the cursor stays under it)
+ * - wheel / pinch: zoom towards the cursor, keeping heading and pitch
+ * - right / middle drag, or Ctrl/Shift + left drag: horizontal = heading,
+ *   vertical = pitch, orbiting the point at the screen center
+ * - double click: fly closer to a point (can be overridden by `doubleClickHandler`)
  * - WASD / arrows: move, Q/E rotate, R/F tilt
+ *
+ * Invariants: the camera never rolls (the horizon stays level), heading is
+ * continuous through the nadir, and gestures never swing the camera over the
+ * top of the orbit pivot. See docs/agents/camera-controller.md.
  */
 export class GlobeCameraController {
   enabled = true;
+  /** Left drag grabs and spins the globe. */
+  enablePan = true;
+  /** Right drag (horizontal) changes the heading. */
+  enableRotate = true;
+  /** Right drag (vertical) changes the pitch. */
+  enableTilt = true;
+  enableZoom = true;
+  enableKeyboard = true;
   inertia = true;
   zoomSpeed = 1;
   rotateSpeed = 1;
+  /** Pivot for right-drag orbiting: the surface point at the screen center or under the cursor. */
+  orbitPivot: 'center' | 'cursor' = 'center';
+  /**
+   * Allowed pitch for orbit / tilt gestures in degrees, [most top-down, closest to level].
+   * Like ThingJS `camera.vertAngleLimit`, expressed as camera pitch (negative looks down).
+   */
+  pitchRangeDeg: [number, number] = [-90, -2];
   /** Minimum camera height above the ground (meters). */
   minimumAltitude = 1.5;
   /** Maximum distance from the earth's center (meters). */
   maximumDistance = 6e7;
+  /**
+   * Called on double click before the default "fly closer" behavior; return
+   * true to consume the event (e.g. to enter a building level).
+   */
+  doubleClickHandler: ((event: MouseEvent) => boolean) | null = null;
+  readonly events = new EventEmitter<ControllerEvents>();
 
   private readonly camera: PerspectiveCamera;
   private readonly ellipsoid: Ellipsoid;
@@ -64,13 +134,16 @@ export class GlobeCameraController {
 
   private zoomPending = 0;
   private readonly zoomTarget = new Vector3();
+  private readonly zoomNdc = new Vector2();
+  private readonly zoomClient = new Vector2();
+  private zoomAnchored = true;
   private hasZoomTarget = false;
   private lastWheelTime = 0;
 
   private touchStart = { dist: 0, angle: 0, midY: 0 };
   private readonly keys = new Set<string>();
   private flight: CameraFlight | null = null;
-  private orbitAnim: { pivot: Vector3; total: number; applied: number; duration: number; elapsed: number } | null = null;
+  private orbitAnim: OrbitAnimation | null = null;
   private flightTarget: FlightTarget | null = null;
   private flightDone: (() => void) | null = null;
   private changed = true;
@@ -109,6 +182,15 @@ export class GlobeCameraController {
     return this.flight !== null;
   }
 
+  /** True while the user is dragging or touching. */
+  get isInteracting(): boolean {
+    return this.mode !== 'none';
+  }
+
+  get isAutoOrbiting(): boolean {
+    return this.orbitAnim !== null && this.orbitAnim.total === Infinity;
+  }
+
   /** True when the camera moved since the last call (used for render-on-demand). */
   consumeChanged(): boolean {
     const c = this.changed;
@@ -139,10 +221,49 @@ export class GlobeCameraController {
    * Animates a heading change of `deltaHeading` radians while orbiting around
    * `pivot` (keeps the pivot fixed on screen).
    */
-  rotateHeadingAround(pivot: Vector3, deltaHeading: number, duration = 0.7): void {
+  rotateHeadingAround(pivot: Vector3, deltaHeading: number, duration = 0.7): Promise<void> {
     this.cancelMotion();
-    // Orbiting by +a about the local up turns the camera heading by -a.
-    this.orbitAnim = { pivot: pivot.clone(), total: -deltaHeading, applied: 0, duration, elapsed: 0 };
+    return new Promise((resolve) => {
+      this.orbitAnim = { pivot: pivot.clone(), total: deltaHeading, applied: 0, duration, speed: 0, elapsed: 0, done: resolve };
+    });
+  }
+
+  /**
+   * Orbits around a point at constant speed (ThingJS `camera.rotateAround` /
+   * `earthFlyRotateBySpeed`). Any user input stops it.
+   */
+  startAutoOrbit(options: AutoOrbitOptions = {}): Promise<void> {
+    this.cancelMotion();
+    const pivot = options.pivot?.clone() ?? this.host.pick(CENTER);
+    if (!pivot) return Promise.resolve();
+    const speed = (options.degreesPerSecond ?? 12) * DEG2RAD;
+    const total = options.totalDegrees !== undefined ? Math.abs(options.totalDegrees) * DEG2RAD * Math.sign(speed || 1) : Infinity;
+    return new Promise((resolve) => {
+      this.orbitAnim = { pivot, total, applied: 0, duration: 0, speed, elapsed: 0, done: resolve };
+    });
+  }
+
+  /**
+   * Moves the camera (or, while flying, the flight's destination) by a world
+   * offset: keeps the view on something that moved, such as a building that
+   * was lifted onto the terrain.
+   */
+  translate(delta: Vector3): void {
+    if (this.flight && this.flightTarget) {
+      this.flight.endOffset.add(delta);
+      this.flightTarget.position.add(delta);
+    } else {
+      this.camera.position.add(delta);
+      this.orbitAnim?.pivot.add(delta);
+    }
+    this.markChanged();
+  }
+
+  stopAutoOrbit(): void {
+    if (!this.orbitAnim) return;
+    const done = this.orbitAnim.done;
+    this.orbitAnim = null;
+    done?.();
   }
 
   cancelFlight(): void {
@@ -161,7 +282,7 @@ export class GlobeCameraController {
     dt = Math.min(dt, 0.1);
     if (this.flight) {
       const running = this.flight.update(dt, this.camera.position, this.camera.quaternion);
-      this.changed = true;
+      this.markChanged();
       if (!running) {
         const t = this.flightTarget!;
         this.camera.position.copy(t.position);
@@ -171,17 +292,7 @@ export class GlobeCameraController {
       return;
     }
 
-    if (this.orbitAnim) {
-      const a = this.orbitAnim;
-      a.elapsed = Math.min(a.duration, a.elapsed + dt);
-      const t = a.elapsed / a.duration;
-      const eased = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
-      const target = a.total * eased;
-      this.orbit(a.pivot, target - a.applied, 0);
-      a.applied = target;
-      if (t >= 1) this.orbitAnim = null;
-      return;
-    }
+    if (this.orbitAnim) this.updateOrbitAnimation(dt);
 
     if (Math.abs(this.zoomPending) > 1e-5) {
       const step = this.zoomPending * (1 - Math.exp(-dt * 14));
@@ -201,6 +312,36 @@ export class GlobeCameraController {
     this.enforceLimits();
   }
 
+  private updateOrbitAnimation(dt: number): void {
+    const a = this.orbitAnim!;
+    a.elapsed += dt;
+    let target: number;
+    let finished = false;
+    if (a.duration > 0) {
+      const t = Math.min(1, a.elapsed / a.duration);
+      const eased = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
+      target = a.total * eased;
+      finished = t >= 1;
+    } else {
+      target = a.speed * a.elapsed;
+      if (Math.abs(target) >= Math.abs(a.total)) {
+        target = a.total;
+        finished = true;
+      }
+    }
+    this.orbit(a.pivot, target - a.applied, 0);
+    a.applied = target;
+    if (finished) {
+      this.orbitAnim = null;
+      a.done?.();
+    }
+  }
+
+  private markChanged(): void {
+    this.changed = true;
+    this.events.emit('change', undefined);
+  }
+
   // ---------------------------------------------------------------------------
   // Pointer handling
 
@@ -209,27 +350,29 @@ export class GlobeCameraController {
     return out.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
   }
 
-  private rayFromNdc(ndc: Vector2, out: Ray): Ray {
-    this.camera.updateMatrixWorld();
-    out.origin.setFromMatrixPosition(this.camera.matrixWorld);
-    out.direction.set(ndc.x, ndc.y, 0.5).unproject(this.camera).sub(out.origin).normalize();
-    return out;
-  }
-
   private cancelMotion(): void {
     this.cancelFlight();
-    this.orbitAnim = null;
+    this.stopAutoOrbit();
     this.spinVelocity = 0;
     this.zoomPending = 0;
+  }
+
+  private beginInteraction(): void {
+    this.cancelMotion();
+    this.events.emit('interactionstart', undefined);
   }
 
   private readonly onContextMenu = (e: Event) => e.preventDefault();
 
   private readonly onPointerDown = (e: PointerEvent) => {
     if (!this.enabled) return;
-    this.dom.setPointerCapture(e.pointerId);
+    try {
+      this.dom.setPointerCapture(e.pointerId);
+    } catch {
+      // Synthetic or already released pointers cannot be captured; dragging still works.
+    }
     this.pointers.set(e.pointerId, new Vector2(e.clientX, e.clientY));
-    this.cancelMotion();
+    this.beginInteraction();
     this.dom.focus?.();
 
     if (e.pointerType === 'touch' && this.pointers.size >= 2) {
@@ -240,27 +383,33 @@ export class GlobeCameraController {
     const ndc = this.ndc(e.clientX, e.clientY);
     const orbit = e.button === 1 || e.button === 2 || e.ctrlKey || e.shiftKey || e.metaKey;
     if (orbit) {
-      this.pivot = this.host.pick(ndc) ?? this.host.pick(new Vector2(0, 0));
+      if (!this.enableRotate && !this.enableTilt) return;
+      this.pivot = this.pickPivot(ndc);
       this.mode = this.pivot ? 'orbit' : 'look';
-    } else {
-      this.beginRotate(ndc);
+    } else if (this.enablePan) {
+      this.beginPan(ndc);
     }
   };
 
-  private beginRotate(ndc: Vector2): void {
+  private pickPivot(ndc: Vector2): Vector3 | null {
+    if (this.orbitPivot === 'center') return this.host.pick(CENTER) ?? this.host.pick(ndc);
+    return this.host.pick(ndc) ?? this.host.pick(CENTER);
+  }
+
+  private beginPan(ndc: Vector2): void {
     const hit = this.host.pick(ndc);
     if (hit) {
       this.grab.copy(hit);
     } else {
       // Missed the globe: grab the closest point of the ray, lifted onto a sphere.
-      this.rayFromNdc(ndc, _ray);
+      rayFromNdc(this.camera, ndc, _ray);
       _ray.closestPointToPoint(_v.set(0, 0, 0), this.grab);
       if (this.grab.lengthSq() < 1) return;
       this.grab.setLength(Math.max(this.grab.length(), this.ellipsoid.minimumRadius));
     }
     this.dragRadius = this.grab.length();
     this.samples = [];
-    this.mode = 'rotate';
+    this.mode = 'pan';
   }
 
   private readonly onPointerMove = (e: PointerEvent) => {
@@ -277,12 +426,15 @@ export class GlobeCameraController {
     this.last.set(e.clientX, e.clientY);
     if (dx === 0 && dy === 0) return;
 
-    if (this.mode === 'rotate') {
+    if (this.mode === 'pan') {
       this.dragTo(this.ndc(e.clientX, e.clientY));
     } else if (this.mode === 'orbit' && this.pivot) {
       const w = this.dom.clientWidth || 1;
       const h = this.dom.clientHeight || 1;
-      this.orbit(this.pivot, (-dx / w) * Math.PI * this.rotateSpeed, (dy / h) * Math.PI * 0.6 * this.rotateSpeed);
+      const dHeading = this.enableRotate ? (dx / w) * Math.PI * this.rotateSpeed : 0;
+      // Dragging up tilts towards the horizon (Mapbox convention).
+      const dTilt = this.enableTilt ? (dy / h) * Math.PI * 0.6 * this.rotateSpeed : 0;
+      this.orbit(this.pivot, dHeading, dTilt);
     } else if (this.mode === 'look') {
       this.look(dx, dy);
     }
@@ -293,12 +445,13 @@ export class GlobeCameraController {
     this.pointers.delete(e.pointerId);
     if (this.dom.hasPointerCapture(e.pointerId)) this.dom.releasePointerCapture(e.pointerId);
 
-    if (this.mode === 'rotate' && this.inertia) this.startInertia();
+    if (this.mode === 'pan' && this.inertia) this.startInertia();
     if (this.mode === 'touch' && this.pointers.size === 1) {
-      // Continue as a one-finger rotate with the remaining pointer.
+      // Continue as a one-finger pan with the remaining pointer.
       const [remaining] = this.pointers.values();
       this.last.copy(remaining);
-      this.beginRotate(this.ndc(remaining.x, remaining.y));
+      if (this.enablePan) this.beginPan(this.ndc(remaining.x, remaining.y));
+      else this.mode = 'none';
       return;
     }
     if (this.pointers.size === 0) {
@@ -308,7 +461,7 @@ export class GlobeCameraController {
   };
 
   private dragTo(ndc: Vector2): void {
-    this.rayFromNdc(ndc, _ray);
+    rayFromNdc(this.camera, ndc, _ray);
     const target = _v;
     const t = intersectSphere(_ray, this.dragRadius);
     if (t !== null) {
@@ -351,39 +504,27 @@ export class GlobeCameraController {
   }
 
   private rotateAboutCenter(q: Quaternion): void {
-    this.camera.position.applyQuaternion(q);
-    this.camera.quaternion.premultiply(q);
-    levelOrientation(this.ellipsoid, this.camera.position, this.camera.quaternion);
-    this.changed = true;
+    rotateCameraAboutCenter(this.ellipsoid, this.camera.position, this.camera.quaternion, q);
+    this.markChanged();
   }
 
-  /** Orbit around `pivot`: heading about its local up, tilt in the vertical plane. */
+  /** Orbit around `pivot`: heading change in radians, tilt in radians (positive raises the camera). */
   private orbit(pivot: Vector3, dHeading: number, dTilt: number): void {
     const cam = this.camera;
-    this.ellipsoid.geodeticSurfaceNormal(pivot, _up);
-
-    _q.setFromAxisAngle(_up, dHeading);
-    rotateAroundPoint(cam.position, cam.quaternion, pivot, _q);
-
-    const offset = _v.subVectors(cam.position, pivot);
-    const range = offset.length();
-    if (range > 1e-6) {
-      const elevation = Math.asin(clamp(offset.dot(_up) / range, -1, 1));
-      const target = clamp(elevation + dTilt, 0.035, Math.PI / 2 - 0.0005);
-      _axis.crossVectors(_up, offset);
-      if (_axis.lengthSq() < 1e-12) _axis.set(1, 0, 0).applyQuaternion(cam.quaternion);
-      _axis.normalize();
-      _q.setFromAxisAngle(_axis, -(target - elevation));
-      const savedPos = cam.position.clone();
-      const savedQ = cam.quaternion.clone();
-      rotateAroundPoint(cam.position, cam.quaternion, pivot, _q);
-      if (this.altitudeAboveGround() < this.minimumAltitude) {
-        cam.position.copy(savedPos);
-        cam.quaternion.copy(savedQ);
-      }
+    _prevPos.copy(cam.position);
+    _prevQ.copy(cam.quaternion);
+    const [minPitch, maxPitch] = this.pitchRangeDeg;
+    // Camera pitch is the negative of its elevation above the pivot's horizon.
+    const minElevation = Math.max(0.5 * DEG2RAD, -maxPitch * DEG2RAD);
+    const maxElevation = Math.min(Math.PI / 2 - 1e-4, -minPitch * DEG2RAD);
+    orbitAround(this.ellipsoid, cam.position, cam.quaternion, pivot, dHeading, dTilt, minElevation, maxElevation);
+    if (dTilt < 0 && this.altitudeAboveGround() < this.minimumAltitude) {
+      // Tilting would push the camera into the ground: keep the previous pose.
+      cam.position.copy(_prevPos);
+      cam.quaternion.copy(_prevQ);
+      if (dHeading !== 0) orbitAround(this.ellipsoid, cam.position, cam.quaternion, pivot, dHeading, 0, minElevation, maxElevation);
     }
-    levelOrientation(this.ellipsoid, cam.position, cam.quaternion);
-    this.changed = true;
+    this.markChanged();
   }
 
   /** Free look: turn the camera in place. */
@@ -393,65 +534,77 @@ export class GlobeCameraController {
     orientationFromHeadingPitch(
       this.ellipsoid,
       this.camera.position,
-      hp.heading - dx * k,
-      clamp(hp.pitch + dy * k, -Math.PI / 2 + 0.001, Math.PI / 2 - 0.001),
+      hp.heading - (this.enableRotate ? dx * k : 0),
+      clamp(hp.pitch + (this.enableTilt ? dy * k : 0), -Math.PI / 2 + 0.001, Math.PI / 2 - 0.001),
       this.camera.quaternion,
     );
-    this.changed = true;
+    this.markChanged();
   }
 
   // ---------------------------------------------------------------------------
   // Zoom
 
   private readonly onWheel = (e: WheelEvent) => {
-    if (!this.enabled) return;
+    if (!this.enabled || !this.enableZoom) return;
     e.preventDefault();
     this.cancelFlight();
+    this.stopAutoOrbit();
     this.spinVelocity = 0;
     let delta = e.deltaY;
     if (e.deltaMode === 1) delta *= 16;
     else if (e.deltaMode === 2) delta *= 120;
     delta = clamp(delta, -300, 300);
     const now = performance.now();
-    if (!this.hasZoomTarget || now - this.lastWheelTime > 250) this.setZoomTarget(this.ndc(e.clientX, e.clientY));
+    const moved = Math.hypot(e.clientX - this.zoomClient.x, e.clientY - this.zoomClient.y) > 4;
+    if (!this.hasZoomTarget || moved || now - this.lastWheelTime > 250) {
+      this.zoomClient.set(e.clientX, e.clientY);
+      this.setZoomTarget(this.ndc(e.clientX, e.clientY));
+    }
     this.lastWheelTime = now;
     this.zoomPending += -delta * 0.0022 * this.zoomSpeed;
   };
 
   private setZoomTarget(ndc: Vector2): void {
+    this.zoomNdc.copy(ndc);
     const hit = this.host.pick(ndc);
     if (hit) {
       this.zoomTarget.copy(hit);
+      this.zoomAnchored = true;
     } else {
       // Sky: zoom along the view ray towards a point at the current altitude distance.
-      this.rayFromNdc(ndc, _ray);
+      rayFromNdc(this.camera, ndc, _ray);
       const alt = Math.max(this.altitude(), 10);
       _ray.at(alt * 2, this.zoomTarget);
+      this.zoomAnchored = false;
     }
     this.hasZoomTarget = true;
   }
 
   private applyZoom(amount: number): void {
     const cam = this.camera;
-    const toTarget = _v.subVectors(this.zoomTarget, cam.position);
-    const dist = toTarget.length();
-    if (dist < 1e-6) return;
-    let newDist = dist * Math.exp(-amount);
-    newDist = Math.max(newDist, 1);
-    const prev = _w.copy(cam.position);
-    cam.position.copy(this.zoomTarget).addScaledVector(toTarget.normalize(), -newDist);
-    if (cam.position.length() > this.maximumDistance) cam.position.copy(prev);
-    if (amount > 0 && this.altitudeAboveGround() < this.minimumAltitude) {
-      // Hit the ground: stop the zoom here.
+    _prevPos.copy(cam.position);
+    _prevQ.copy(cam.quaternion);
+    zoomTowards(this.ellipsoid, cam, this.zoomTarget, this.zoomNdc, {
+      amount,
+      minDistance: Math.max(1, this.minimumAltitude),
+      anchored: this.zoomAnchored,
+    });
+    const tooFar = cam.position.length() > this.maximumDistance;
+    const tooLow = amount > 0 && this.altitudeAboveGround() < this.minimumAltitude;
+    if (tooFar || tooLow) {
+      // Hit a limit: stop here instead of being pushed sideways by the limit enforcement.
+      cam.position.copy(_prevPos);
+      cam.quaternion.copy(_prevQ);
       this.zoomPending = 0;
     }
-    levelOrientation(this.ellipsoid, cam.position, cam.quaternion);
-    this.changed = true;
+    this.markChanged();
   }
 
   private readonly onDoubleClick = (e: MouseEvent) => {
     if (!this.enabled) return;
-    const hit = this.host.pick(this.ndc(e.clientX, e.clientY));
+    if (this.doubleClickHandler?.(e)) return;
+    if (!this.enableZoom) return;
+    const hit = this.host.pick(this.ndc(e.clientX, e.clientY, _ndc));
     if (!hit) return;
     const hp = getHeadingPitch(this.ellipsoid, this.camera.position, this.camera.quaternion);
     const range = this.camera.position.distanceTo(hit) * 0.35;
@@ -486,12 +639,13 @@ export class GlobeCameraController {
     const m = this.touchMetrics();
     const s = this.touchStart;
     const zoom = Math.log(m.dist / s.dist);
-    if (Math.abs(zoom) > 1e-4) this.applyZoom(zoom);
+    if (this.enableZoom && Math.abs(zoom) > 1e-4) this.applyZoom(zoom);
     if (this.pivot) {
       let dAngle = m.angle - s.angle;
       dAngle = Math.atan2(Math.sin(dAngle), Math.cos(dAngle));
       const dy = m.mid.y - s.midY;
-      this.orbit(this.pivot, dAngle, (dy / (this.dom.clientHeight || 1)) * Math.PI * 0.6);
+      // Twisting the fingers clockwise turns the map with them.
+      this.orbit(this.pivot, this.enableRotate ? -dAngle : 0, this.enableTilt ? (dy / (this.dom.clientHeight || 1)) * Math.PI * 0.6 : 0);
     }
     this.touchStart = { dist: m.dist, angle: m.angle, midY: m.mid.y };
   }
@@ -500,11 +654,11 @@ export class GlobeCameraController {
   // Keyboard
 
   private readonly onKeyDown = (e: KeyboardEvent) => {
-    if (!this.enabled || isTyping(e)) return;
+    if (!this.enabled || !this.enableKeyboard || isTyping(e)) return;
     const k = e.key.toLowerCase();
     if (['w', 'a', 's', 'd', 'q', 'e', 'r', 'f', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) {
       this.keys.add(k);
-      this.cancelMotion();
+      if (this.keys.size === 1) this.beginInteraction();
     }
   };
 
@@ -522,7 +676,7 @@ export class GlobeCameraController {
     const tilt = (k.has('r') ? 1 : 0) - (k.has('f') ? 1 : 0);
     const cam = this.camera;
 
-    if (forward || strafe) {
+    if ((forward || strafe) && this.enablePan) {
       const hp = getHeadingPitch(this.ellipsoid, cam.position, cam.quaternion);
       const speed = Math.max(this.altitudeAboveGround(), 20) * 0.9;
       const dist = speed * dt;
@@ -541,16 +695,16 @@ export class GlobeCameraController {
         this.rotateAboutCenter(_q);
       }
     }
-    if (turn || tilt) {
+    if ((turn && this.enableRotate) || (tilt && this.enableTilt)) {
       const hp = getHeadingPitch(this.ellipsoid, cam.position, cam.quaternion);
       orientationFromHeadingPitch(
         this.ellipsoid,
         cam.position,
-        hp.heading + turn * dt * 0.9,
-        clamp(hp.pitch + tilt * dt * 0.7, -Math.PI / 2 + 0.001, Math.PI / 2 - 0.001),
+        hp.heading + (this.enableRotate ? turn * dt * 0.9 : 0),
+        clamp(hp.pitch + (this.enableTilt ? tilt * dt * 0.7 : 0), -Math.PI / 2 + 0.001, Math.PI / 2 - 0.001),
         cam.quaternion,
       );
-      this.changed = true;
+      this.markChanged();
     }
   }
 
@@ -565,7 +719,7 @@ export class GlobeCameraController {
   altitudeAboveGround(): number {
     const c = this.ellipsoid.cartesianToCartographic(this.camera.position, _carto);
     if (!c) return 0;
-    return c.height - this.host.groundHeight(c.longitude, c.latitude);
+    return c.height - (this.host.groundHeight(c.longitude, c.latitude) ?? 0);
   }
 
   private enforceLimits(): void {
@@ -573,34 +727,16 @@ export class GlobeCameraController {
     const len = cam.position.length();
     if (len > this.maximumDistance) {
       cam.position.setLength(this.maximumDistance);
-      this.changed = true;
+      this.markChanged();
     }
     const c = this.ellipsoid.cartesianToCartographic(cam.position, _carto);
     if (!c) return;
     const ground = this.host.groundHeight(c.longitude, c.latitude);
-    if (c.height < ground + this.minimumAltitude) {
+    if (ground !== null && c.height < ground + this.minimumAltitude) {
       this.ellipsoid.cartographicToCartesian(c.longitude, c.latitude, ground + this.minimumAltitude, cam.position);
-      this.changed = true;
+      this.markChanged();
     }
   }
-}
-
-function rotateAroundPoint(position: Vector3, quaternion: Quaternion, pivot: Vector3, q: Quaternion): void {
-  position.sub(pivot).applyQuaternion(q).add(pivot);
-  quaternion.premultiply(q);
-}
-
-/** Nearest positive ray/sphere (centered at origin) intersection distance. */
-function intersectSphere(ray: Ray, radius: number): number | null {
-  const b = ray.origin.dot(ray.direction);
-  const c = ray.origin.lengthSq() - radius * radius;
-  const d = b * b - c;
-  if (d < 0) return null;
-  const s = Math.sqrt(d);
-  const t0 = -b - s;
-  if (t0 > 0) return t0;
-  const t1 = -b + s;
-  return t1 > 0 ? t1 : null;
 }
 
 function isTyping(e: KeyboardEvent): boolean {
