@@ -7,6 +7,7 @@
 | 相机控制器（手势、不变量、数学） | [docs/agents/camera-controller.md](docs/agents/camera-controller.md) |
 | 瓦片加载（底图 / 地形 / 3D Tiles） | [docs/agents/tile-loading.md](docs/agents/tile-loading.md) |
 | 室内与 BIM 模型定义、层级导航 | [docs/agents/indoor-bim.md](docs/agents/indoor-bim.md) |
+| 可借鉴与复用路线图（分阶段落地计划，开始新功能前先看） | [docs/agents/roadmap.md](docs/agents/roadmap.md) |
 | ThingJS 示例分析与能力对照 | [docs/agents/thingjs-reference.md](docs/agents/thingjs-reference.md) |
 | ThingJS 运行时源码分析、可借鉴的实现与落地清单（改层级、拾取、事件、样式前先看） | [docs/agents/thingjs-runtime-analysis.md](docs/agents/thingjs-runtime-analysis.md) |
 

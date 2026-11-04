@@ -243,6 +243,7 @@ viewer.interaction.on('click', (e) => console.log(e.object?.properties), { selec
 ## 开发说明
 
 - 开发规范与踩坑记录：[AGENTS.md](AGENTS.md)（`CLAUDE.md` 引用它）；子系统规范：相机、瓦片加载、室内 BIM、ThingJS 对照与运行时源码分析（[docs/agents/](docs/agents/)）
+- 路线图：[docs/agents/roadmap.md](docs/agents/roadmap.md)（可借鉴、可复用内容的分阶段落地计划）
 - `scripts/generate-egm96.mjs`：从 NGA EGM96（经 `egm96-universal` 包）重新生成 `src/core/egm96Grid.ts`
 - 依赖版本锁定为发布满两周以上的版本（three r186.1、3d-tiles-renderer 0.5.3、Vite 8）
 - `.npmrc` 设置了 `legacy-peer-deps=true`：npm 在 Vite 8 + Vitest 5 的可选 peer 依赖环上有解析 bug
