@@ -1,7 +1,9 @@
 # Three Geo Global
 
-基于 three.js 的 **WebGPU 优先** 三维地理空间浏览器：WGS84 椭球、四叉树影像瓦片、全球地形、物理大气、OGC 3D Tiles、GeoJSON 矢量与注记。
+基于 three.js 的 **WebGPU 优先** 三维地理空间浏览器：WGS84 椭球、四叉树影像瓦片、全球地形、物理大气、OGC 3D Tiles、GeoJSON 矢量与注记，以及从地球无缝进入建筑 / 楼层 / 房间的**室内 BIM 浏览**（顶牌、事件、层级导航，参考 ThingJS）。
 对标 CesiumJS / Google Earth 的核心浏览体验，先实现一个可扩展的基础版本。
+
+> 参与开发（人或 AI 代理）请先读 [AGENTS.md](AGENTS.md)，子系统规范在 [docs/agents/](docs/agents/)。
 
 | 全球视角（WebGPU） | 近地轨道大气 | 昼夜晨昏线 |
 | --- | --- | --- |
@@ -15,7 +17,11 @@
 | --- | --- |
 | ![geojson](docs/images/geojson-labels.jpg) | ![popup](docs/images/feature-popup.jpg) |
 
-> 截图在无头 Chromium（SwiftShader 软件 GPU）里生成，沙箱访问不了 ArcGIS/OSM，所以用的是 Blue Marble 单图和调试网格影像。本地运行默认是 ArcGIS 卫星影像。
+| 室内楼层：房间 / 机柜 / 温湿度顶牌（避让）+ 层级条 | 进入房间：高亮 + 属性面板 + 告警卡片 |
+| --- | --- |
+| ![indoor-floor](docs/images/indoor-floor.jpg) | ![indoor-room](docs/images/indoor-room.jpg) |
+
+> 前两行截图在无头 Chromium（SwiftShader 软件 GPU）里生成，沙箱访问不了 ArcGIS/OSM，所以用的是 Blue Marble 单图和调试网格影像；室内截图为 Chrome WebGPU + ArcGIS 影像 + Cesium World Terrain。本地运行默认是 ArcGIS 卫星影像。
 
 ## 快速开始
 
@@ -37,16 +43,19 @@ npm test           # 核心数学单元测试（vitest）
 | `?noterrain` | 启动时关闭地形（地形源在面板里切换，含 Mapbox / MapTiler / Cesium World Terrain / quantized-mesh） |
 | `?tileset=<url>` | 启动后加载一个 3D Tiles（tileset.json） |
 | `?geojson=<url>` | 启动后加载 GeoJSON（可重复多次） |
+| `?demo` | 加载程序生成的示例办公楼（5 层，房间 / 设备 / 传感器 / 机房告警）并进入 |
+| `?building=<url>` | 加载 `three-geo-building` 格式的建筑文档（格式见 [docs/agents/indoor-bim.md](docs/agents/indoor-bim.md)） |
 | `#lon,lat,height,heading,pitch` | 相机位置（会随浏览自动更新，可直接分享链接） |
 
 ### 操作
 
-- 左键拖拽：抓住地面旋转地球（光标下的点始终跟手），松手有惯性
-- 滚轮 / 双指捏合：向光标处缩放
-- 右键、中键或 Ctrl/Shift + 左键拖拽：绕光标处的点旋转航向、调整俯仰
-- 双击：飞近该点；指北针：点击复位朝北
-- 单击矢量要素或注记：弹出属性面板并高亮；Esc 关闭
-- 把 `.geojson` / `.json` 文件直接拖进窗口即可加载
+- 左键拖拽：抓住地面平移（光标下的点始终跟手），松手有惯性
+- 滚轮 / 双指捏合：向光标处缩放，**保持当前航向与俯仰**（俯视保持俯视，不会翻转）
+- 右键、中键或 Ctrl/Shift + 左键拖拽：**横向调航向、纵向调俯仰**（默认绕屏幕中心点，面板“相机”里可改为光标处、限制最大倾斜）
+- 双击：进入建筑 / 楼层 / 房间（室内），否则飞近该点；**右键单击或 Esc：返回上一级**
+- 单击建筑、房间、设备或矢量要素：高亮并弹出属性面板；Esc 关闭
+- 指北针：点击复位朝北；面板“相机 → 环绕浏览”：绕视野中心匀速旋转
+- 把 `.geojson` / `.json` / `.building.json` 文件直接拖进窗口即可加载
 - 键盘：WASD / 方向键平移，Q/E 转向，R/F 俯仰
 
 ## 已实现能力
@@ -61,7 +70,8 @@ npm test           # 核心数学单元测试（vitest）
 **地球与数据**
 - WGS84 椭球数学（Newton 迭代投影、ENU 坐标系、射线求交），全部 float64
 - Web Mercator 四叉树：屏幕空间误差（以“影像纹素占多少 CSS 像素”计）选择 LOD、视锥裁剪 + 椭球地平线裁剪（Cesium 的 horizon culling point）、裙边消除裂缝、极地补盖（颜色取自影像边缘）
-- 加载调度：按层级 + 距离排序的优先队列、并发上限、离开视野自动取消请求、叶子优先的 LRU 淘汰、子瓦片未就绪时父瓦片兜底（无空洞）、超出影像最大层级时放大祖先纹理
+- 加载调度（[规范](docs/agents/tile-loading.md)）：几何 / 影像 / 叠加三条独立通道与并发上限；五级优先级桶 + **视野中心优先**；跨级“锚点”影像（大跨度缩放一个往返就变清晰）；新影像**交叉淡入**；每帧上传预算 + 背压；离开视野自动取消、指数退避重试、叶子优先的 LRU 淘汰；首屏根瓦片先以平面立即显示
+- 地形取数比网格低 3 级（一张 256 px 高程图服务 8×8 个网格瓦片，请求量降到 1/64 且不损失精度）；子瓦片先用**精确祖先**高度插值出临时网格（≤3 级）立即可渲染，真实地形随后替换；临时网格的子瓦片用保守包围体，杜绝空洞；相机防入地只采信足够精细的地形
 - 影像源：XYZ 模板（ArcGIS、OSM、Carto、天地图等预设 + 自定义 URL）、单张等经纬度全球图、离线调试网格
 - 叠加图层：天地图影像注记、Esri 边界地名 / 交通、Carto 注记、OpenRailwayMap 等半透明图层，可调不透明度、顺序、显隐；与矢量栅格一起**合成为每个瓦片的一张叠加纹理**，着色器始终只多一次纹理采样；压缩瓦片缓存，矢量变化时不重复下载
 - 地形源（在 Web Worker 里解码并构网，含法线、包围体、地平线点，超出最大层级时从父级上采样；可调高程夸张）：
@@ -77,7 +87,9 @@ npm test           # 核心数学单元测试（vitest）
 
 **3D Tiles**
 - 基于 NASA-AMMOS 3DTilesRendererJS 的核心调度（b3dm / i3dm / pnts / cmpt / glTF、隐式分块）
-- Draco / KTX2 / Meshopt 解码；Cesium ion、Google 真实感 3D Tiles 鉴权；GPU 显存回收
+- Draco / KTX2 / Meshopt 解码；Cesium ion、Google 真实感 3D Tiles 鉴权
+- **WebGPU 下的 LOD 渐显**：瓦片材质在解析阶段转为节点材质，官方渐显插件的材质管理换成 TSL 抖动遮罩（官方版依赖 `onBeforeCompile`，在 WebGPU 下无效）
+- 显存回收带预算（隐藏瓦片在 192 MB 内保留，回头看不再重新上传）；进入建筑时自动压制 3D Tiles
 - 图层管理：显隐、飞到图层、高度偏移、一键贴地（针对以椭球面为基准的样例数据）
 
 **GeoJSON 矢量与注记**
@@ -90,10 +102,18 @@ npm test           # 核心数学单元测试（vitest）
 - 点击查询：注记命中优先，其次在 Worker 里做点在面内 / 点到线距离判定，返回属性并高亮该要素
 - 预设数据：Natural Earth 国界、省级区划、城市、河流（公有领域，示例用）
 
-**交互与界面**
-- 自研相机控制器（抓取式旋转、光标缩放、绕点环绕、惯性、触屏手势、键盘漫游、防入地）
-- 大圆弧线飞行（高度随距离抬升，飞行中自动俯视）
-- 图层面板、状态栏（帧率 / GPU 耗时 / 瓦片统计 / 相机与光标经纬高）、指北针、数据署名
+**室内 / BIM（[规范](docs/agents/indoor-bim.md)）**
+- `three-geo-building` JSON 格式：建筑 → 楼层 → 房间 / 构件 / 设备，层级对齐 IFC 空间结构与 ThingJS；地理锚点（经纬高 + 朝向，省略高度自动贴地）；属性集、分类、IFC 类型；带 JSON 路径的校验错误
+- 几何：程序生成（楼板、按类别着色的房间、内缩墙体与门洞、设备图元、玻璃幕墙外壳）或 glTF（按节点名 / `extras.id` 映射到实体，其余为静态几何）
+- 层级导航：双击进入、右键 / Esc / 面包屑返回、楼层切换条、楼层展开；`beforeEnterLevel` / `enterLevel` / `leaveLevel` 事件；相机按层级取景飞行
+- 实体 API：选择器查询（`.Room`、`#id`、`[category=camera]`、名称、正则、谓词）、样式（颜色 / 透明度 / 高亮）、包围体、属性面板
+
+**交互、顶牌与相机（参考 ThingJS，[对照表](docs/agents/thingjs-reference.md)、[运行时源码分析](docs/agents/thingjs-runtime-analysis.md)）**
+- 统一事件：`viewer.interaction.on('click' | 'dblclick' | 'rightclick' | 'mousemove' | 'mouseenter' | 'mouseleave', fn, { selector, tag })`，选择器冒泡、标签批量注销、`preventDefault()` 屏蔽默认行为
+- HTML 顶牌：float64 投影、地平线 / 距离 / 视口裁剪、优先级避让；数据驱动显示模式（常显 / 进入层级后 / 悬停 / 点击）；卡片 / 图钉 / 标签三种样式
+- 自研相机控制器（[规范](docs/agents/camera-controller.md)）：零 roll、俯视不翻转的航向算法、保持姿态的光标缩放、右键航向 / 俯仰、俯仰范围、手势开关、环绕巡航、惯性、触屏、键盘、按可靠地形防入地
+- 相机 API：`flyTo`、`flyToTarget({ target, heading, pitch, range })`、`flyToSphere`、`flyToEntity`、`startAutoOrbit`、`resetNorth`；大圆弧线飞行
+- 图层面板、状态栏（帧率 / GPU 耗时 / 瓦片与待影像统计 / 相机与光标经纬高）、层级条、指北针、数据署名
 
 ## 架构
 
@@ -107,6 +127,10 @@ flowchart LR
     V --> A["大气 / 星空<br/>TSL 节点"]
     V --> L["LabelManager<br/>注记图集 · 避让"]
     V --> VS["VectorService<br/>图层顺序 · 区域失效"]
+    V --> IN["IndoorManager<br/>建筑 · 楼层 · 房间 · 层级"]
+    V --> MK["MarkerManager<br/>HTML 顶牌 · 避让"]
+    V --> IA["InteractionManager<br/>拾取事件 · 选择器"]
+    IN --> MK
     G --> M["TileMaterial<br/>共享节点图"]
     G --> I["ImageryProvider"]
     VS -->|"叠加纹理"| G
@@ -125,10 +149,12 @@ src/
 ├─ core/        椭球、测地学、EGM96、太阳位置、事件
 ├─ globe/       四叉树（Globe / GlobeTile）、分块方案、Worker、影像源、地形源、瓦片材质
 ├─ atmosphere/  散射节点（天空 / 空气透视）、星空
-├─ tiles3d/     3D Tiles 图层封装
+├─ tiles3d/     3D Tiles 图层封装、节点材质与 WebGPU 渐显
 ├─ vector/      GeoJSON 图层、矢量 Worker、注记管理、几何算法
-├─ viewer/      GeoViewer、相机控制器、相机数学、飞行动画
-└─ ui/          控制面板、状态栏、预设
+├─ indoor/      BIM 文档格式、实体与选择器、建筑构建、层级导航、示例建筑
+├─ markers/     HTML 顶牌管理与卡片模板
+├─ viewer/      GeoViewer、相机控制器、相机数学、飞行动画、交互事件
+└─ ui/          控制面板、室内面板、层级条、状态栏、属性弹窗、预设
 ```
 
 最小代码示例：
@@ -153,6 +179,13 @@ const countries = viewer.addGeoJson({
   label: { field: 'NAME_ZH' },
 });
 countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
+
+// 室内：加载建筑文档，监听层级事件，查询房间并改样式
+const building = viewer.indoor.add(await (await fetch('/office.building.json')).json());
+viewer.indoor.events.on('enterLevel', ({ object }) => console.log('进入', object?.name ?? '地球'));
+await viewer.indoor.enter(building);
+viewer.indoor.query('[category=meeting]').forEach((room) => room.setStyle({ color: '#ffd166' }));
+viewer.interaction.on('click', (e) => console.log(e.object?.properties), { selector: '.Thing', tag: 'demo' });
 ```
 
 ## 与成熟产品对标
@@ -168,6 +201,7 @@ countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
 | 大气 | ✅ | ✅ | 风格化 | ✅ | ✅ 物理散射 + 光晕 |
 | 昼夜 / 太阳 | ✅ | ✅ | 风格化光照 | ✅ | ✅ 按日期计算太阳位置 |
 | 矢量 / 标注 | ✅ | ✅ | ✅ 强项 | ✅ | ✅ GeoJSON 贴地 + 注记避让 |
+| 室内 / BIM 层级 | 需自建 | ❌ | ❌ | ✅ 楼层过滤 | ✅ 建筑 → 楼层 → 房间，顶牌 + 事件 |
 | 阴影 / 后处理 | ✅ | ✅ | 部分 | ✅ | ⏳ 路线图 |
 
 定位：在 three.js 生态里做一个“像 Cesium 一样懂地理、像 three.js 一样好扩展”的地球底座，并且从第一天起按 WebGPU 的方式写（TSL、计算着色器友好、绑定组 / 管线复用）。
@@ -176,9 +210,10 @@ countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
 
 - 影像（底图与叠加）只支持 Web Mercator 瓦片，±85.05° 以外用纯色极盖
 - Cesium ion / quantized-mesh、Mapbox、MapTiler 在开发沙箱里无法联网，只验证了解码与重采样（单元测试）和错误提示，需在真实网络下确认；ion 访问令牌约 1 小时过期，过期后需重新点“应用”
-- LOD 严格自顶向下细化，长距离飞行后需逐级加载（尚未做 skip-LOD）
+- 临时（插值）地形在真实数据到达时会有一次轻微“跳变”（尚未做几何形变过渡）；山区的粗层级插值误差较大，因此最多跨 3 级
 - 地形法线在瓦片边界用单侧差分，开启光照时可能看到细微接缝
-- 3D Tiles 的渐显（TilesFadePlugin）与影像叠加（ImageOverlayPlugin）依赖 `onBeforeCompile`，在 WebGPU 下不可用，暂未启用；点云（pnts）在 WebGPU 下为 1 像素点
+- 3D Tiles 的影像叠加（ImageOverlayPlugin）依赖 `onBeforeCompile`，在 WebGPU 下不可用；点云（pnts）在 WebGPU 下为 1 像素点
+- 室内：设备按“一个网格一份材质”渲染，适合几百到一两千个；顶牌没有深度遮挡；尚不支持 IFC 直读、剖切与室内导航
 - 相机防入地只参考地形，不参考 3D Tiles 表面；隐藏地球（如加载 Google 3D Tiles）时以椭球面为准
 - 矢量按瓦片栅格化贴地：线宽是屏幕像素级的，但瓦片切换的过渡期内线条会短暂变虚；暂不支持面拉伸（3D 建筑）、沿线排布的注记和图标符号
 - 注记不会被 3D Tiles 建筑遮挡（只判断地平线和地形遮挡）
@@ -190,8 +225,9 @@ countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
 **近期（v0.2）——数据与可用性**
 - 地形与 3D Tiles 统一高程查询（贴地、防入地都考虑 3D Tiles 表面）；瓦片边界法线拼接
 - 矢量进阶：MVT 矢量瓦片、面拉伸（建筑白模）、沿线注记、图标符号、点聚合
-- 3D Tiles 要素拾取与属性查询（EXT_mesh_features / batch table），高亮
-- 跳级加载（skip-LOD）与基于帧预算的 GPU 上传
+- 3D Tiles 要素拾取与属性查询（EXT_mesh_features / batch table），高亮；接入统一事件
+- 临时地形到精确地形的几何形变过渡；Worker 间共享高程缓存
+- 室内：IFC 直读（web-ifc）与按楼层流式加载、剖切面 / 剖切盒、室内导航、设备实例化渲染、实体描边
 
 **中期（v0.3）——深度用好 WebGPU**
 - 计算着色器预计算大气 LUT（透射率 / 多次散射 / 天空视图，Hillaire 2020），提升质量并降低每像素开销
@@ -206,6 +242,7 @@ countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
 
 ## 开发说明
 
+- 开发规范与踩坑记录：[AGENTS.md](AGENTS.md)（`CLAUDE.md` 引用它）；子系统规范：相机、瓦片加载、室内 BIM、ThingJS 对照与运行时源码分析（[docs/agents/](docs/agents/)）
 - `scripts/generate-egm96.mjs`：从 NGA EGM96（经 `egm96-universal` 包）重新生成 `src/core/egm96Grid.ts`
 - 依赖版本锁定为发布满两周以上的版本（three r186.1、3d-tiles-renderer 0.5.3、Vite 8）
 - `.npmrc` 设置了 `legacy-peer-deps=true`：npm 在 Vite 8 + Vitest 5 的可选 peer 依赖环上有解析 bug
