@@ -111,3 +111,97 @@ export const IMAGERY_PRESETS: ImageryPreset[] = [
 export function findImageryPreset(id: string): ImageryPreset | undefined {
   return IMAGERY_PRESETS.find((p) => p.id === id);
 }
+
+export interface OverlayPreset {
+  id: string;
+  name: string;
+  requiresKey?: 'tianditu';
+  /** Suggested initial opacity. */
+  opacity: number;
+  create(key?: string): ImageryProvider;
+}
+
+/** Semi-transparent raster layers composited over the base imagery. */
+export const OVERLAY_PRESETS: OverlayPreset[] = [
+  {
+    id: 'tianditu-cia',
+    name: '天地图影像注记（需 key）',
+    requiresKey: 'tianditu',
+    opacity: 1,
+    create: (key = '') =>
+      new XYZImageryProvider({
+        id: 'tianditu-cia',
+        name: '天地图影像注记',
+        url: 'https://t{s}.tianditu.gov.cn/cia_w/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=cia&STYLE=default&TILEMATRIXSET=w&FORMAT=tiles&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&tk={tk}',
+        subdomains: ['0', '1', '2', '3', '4', '5', '6', '7'],
+        minZoom: 1,
+        maxZoom: 18,
+        params: { tk: key },
+        attribution: '© 天地图',
+      }),
+  },
+  {
+    id: 'esri-places',
+    name: 'Esri 边界与地名',
+    opacity: 1,
+    create: () =>
+      new XYZImageryProvider({
+        id: 'esri-places',
+        name: 'Esri Boundaries & Places',
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+        maxZoom: 19,
+        attribution: 'Labels © Esri and contributors',
+      }),
+  },
+  {
+    id: 'esri-transport',
+    name: 'Esri 交通路网',
+    opacity: 0.9,
+    create: () =>
+      new XYZImageryProvider({
+        id: 'esri-transport',
+        name: 'Esri Transportation',
+        url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}',
+        maxZoom: 19,
+        attribution: 'Roads © Esri and contributors',
+      }),
+  },
+  {
+    id: 'carto-labels',
+    name: 'Carto 地名注记',
+    opacity: 1,
+    create: () =>
+      new XYZImageryProvider({
+        id: 'carto-labels',
+        name: 'Carto labels',
+        url: 'https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}.png',
+        subdomains: ['a', 'b', 'c', 'd'],
+        maxZoom: 20,
+        attribution: '© OpenStreetMap contributors © CARTO',
+      }),
+  },
+  {
+    id: 'openrailwaymap',
+    name: 'OpenRailwayMap 铁路',
+    opacity: 0.9,
+    create: () =>
+      new XYZImageryProvider({
+        id: 'openrailwaymap',
+        name: 'OpenRailwayMap',
+        url: 'https://{s}.tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png',
+        subdomains: ['a', 'b', 'c'],
+        maxZoom: 19,
+        attribution: 'Railways © OpenRailwayMap (CC-BY-SA), © OpenStreetMap contributors',
+      }),
+  },
+  {
+    id: 'debug-overlay',
+    name: '调试网格（离线）',
+    opacity: 0.35,
+    create: () => new DebugImageryProvider(),
+  },
+];
+
+export function findOverlayPreset(id: string): OverlayPreset | undefined {
+  return OVERLAY_PRESETS.find((p) => p.id === id);
+}

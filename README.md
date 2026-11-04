@@ -34,7 +34,7 @@ npm test           # 核心数学单元测试（vitest）
 | --- | --- |
 | `?webgl` | 强制使用 WebGL 2 后端（对比调试用） |
 | `?imagery=osm` | 指定底图：`esri-imagery` `osm` `carto-voyager` `carto-dark` `esri-topo` `tianditu-img` `blue-marble` `debug` |
-| `?noterrain` | 启动时关闭地形 |
+| `?noterrain` | 启动时关闭地形（地形源在面板里切换，含 Mapbox / MapTiler / Cesium World Terrain / quantized-mesh） |
 | `?tileset=<url>` | 启动后加载一个 3D Tiles（tileset.json） |
 | `?geojson=<url>` | 启动后加载 GeoJSON（可重复多次） |
 | `#lon,lat,height,heading,pitch` | 相机位置（会随浏览自动更新，可直接分享链接） |
@@ -63,8 +63,11 @@ npm test           # 核心数学单元测试（vitest）
 - Web Mercator 四叉树：屏幕空间误差（以“影像纹素占多少 CSS 像素”计）选择 LOD、视锥裁剪 + 椭球地平线裁剪（Cesium 的 horizon culling point）、裙边消除裂缝、极地补盖（颜色取自影像边缘）
 - 加载调度：按层级 + 距离排序的优先队列、并发上限、离开视野自动取消请求、叶子优先的 LRU 淘汰、子瓦片未就绪时父瓦片兜底（无空洞）、超出影像最大层级时放大祖先纹理
 - 影像源：XYZ 模板（ArcGIS、OSM、Carto、天地图等预设 + 自定义 URL）、单张等经纬度全球图、离线调试网格
-- 地形：AWS Terrarium 全球 DEM（SRTM / GMTED / ETOPO1），在 Web Worker 里解码并构网（含法线、包围体、地平线点），15 级以上从父级上采样；高程夸张
-- 高程基准：海拔经 **EGM96 大地水准面**（1° 网格，RMS 误差 0.41 m）改正为椭球高，与 3D Tiles、GNSS 数据对齐
+- 叠加图层：天地图影像注记、Esri 边界地名 / 交通、Carto 注记、OpenRailwayMap 等半透明图层，可调不透明度、顺序、显隐；与矢量栅格一起**合成为每个瓦片的一张叠加纹理**，着色器始终只多一次纹理采样；压缩瓦片缓存，矢量变化时不重复下载
+- 地形源（在 Web Worker 里解码并构网，含法线、包围体、地平线点，超出最大层级时从父级上采样；可调高程夸张）：
+  - AWS Terrain Tiles（Terrarium，免 key）、Mapbox Terrain-RGB、MapTiler Terrain（RGB 编码）
+  - Cesium World Terrain（ion）与任意 **quantized-mesh** 服务（layer.json）：按 EPSG:4326 地理瓦片取数，三角网栅格化后重采样到墨卡托网格，缺失瓦片自动回退父级
+- 高程基准：海拔类数据经 **EGM96 大地水准面**（1° 网格，RMS 误差 0.41 m）改正为椭球高；quantized-mesh 本身是椭球高；两者都与 3D Tiles、GNSS 数据对齐
 
 **大气与环境**
 - 物理单次散射大气（Rayleigh + Mie + 臭氧），视线方向光线步进，太阳方向用 Chapman 函数解析近似，替代嵌套循环
@@ -159,8 +162,8 @@ countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
 | 渲染后端 | WebGL 2 | WebGL / Wasm | WebGL 2 | WebGL 2 | **WebGPU 优先**，WebGL 2 回退 |
 | 着色语言 | GLSL | 内部 | GLSL | GLSL | **TSL → WGSL / GLSL** |
 | 椭球 + 高精度 | ✅ RTC / RTE | ✅ | 近似球 | ✅ | ✅ FP64 矩阵 + RTC |
-| 影像瓦片 | ✅ 多图层叠加 | 内置 | ✅ 矢量瓦片为主 | ✅ | ✅ 单图层 XYZ |
-| 地形 | ✅ quantized-mesh | ✅ | ✅ raster-dem | ✅ | ✅ Terrarium + EGM96 |
+| 影像瓦片 | ✅ 多图层叠加 | 内置 | ✅ 矢量瓦片为主 | ✅ | ✅ 底图 + 叠加图层 |
+| 地形 | ✅ quantized-mesh | ✅ | ✅ raster-dem | ✅ | ✅ Terrarium / Terrain-RGB / quantized-mesh + EGM96 |
 | 3D Tiles | ✅ 原生 | 自有格式 | 自有 3D 格式 | ✅ I3S / 3D Tiles | ✅ 3DTilesRendererJS |
 | 大气 | ✅ | ✅ | 风格化 | ✅ | ✅ 物理散射 + 光晕 |
 | 昼夜 / 太阳 | ✅ | ✅ | 风格化光照 | ✅ | ✅ 按日期计算太阳位置 |
@@ -171,7 +174,8 @@ countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
 
 ## 已知限制
 
-- 影像只支持单图层、Web Mercator（±85.05° 以外用纯色极盖）；暂不支持注记层叠加
+- 影像（底图与叠加）只支持 Web Mercator 瓦片，±85.05° 以外用纯色极盖
+- Cesium ion / quantized-mesh、Mapbox、MapTiler 在开发沙箱里无法联网，只验证了解码与重采样（单元测试）和错误提示，需在真实网络下确认；ion 访问令牌约 1 小时过期，过期后需重新点“应用”
 - LOD 严格自顶向下细化，长距离飞行后需逐级加载（尚未做 skip-LOD）
 - 地形法线在瓦片边界用单侧差分，开启光照时可能看到细微接缝
 - 3D Tiles 的渐显（TilesFadePlugin）与影像叠加（ImageOverlayPlugin）依赖 `onBeforeCompile`，在 WebGPU 下不可用，暂未启用；点云（pnts）在 WebGPU 下为 1 像素点
@@ -184,8 +188,7 @@ countries.events.on('ready', (s) => viewer.flyToBBox(s.bbox!));
 ## 路线图
 
 **近期（v0.2）——数据与可用性**
-- 多影像图层（底图 + 注记 + 透明度），用纹理数组 / 图集替代单纹理
-- quantized-mesh 地形（Cesium World Terrain / 自建），地形与 3D Tiles 统一高程查询
+- 地形与 3D Tiles 统一高程查询（贴地、防入地都考虑 3D Tiles 表面）；瓦片边界法线拼接
 - 矢量进阶：MVT 矢量瓦片、面拉伸（建筑白模）、沿线注记、图标符号、点聚合
 - 3D Tiles 要素拾取与属性查询（EXT_mesh_features / batch table），高亮
 - 跳级加载（skip-LOD）与基于帧预算的 GPU 上传

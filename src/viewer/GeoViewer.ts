@@ -22,6 +22,7 @@ import { EventEmitter } from '../core/EventEmitter';
 import { clamp, DEG2RAD, smoothstep } from '../core/math';
 import { greenwichMeanSiderealTime, sunDirectionECEF } from '../core/SunPosition';
 import { Globe, type GlobeOptions } from '../globe/Globe';
+import { OverlayCompositor } from '../globe/OverlayCompositor';
 import { Tiles3DLayer, type LoaderKit, type Tiles3DLayerOptions } from '../tiles3d/Tiles3DLayer';
 import { GeoJsonLayer, type GeoJsonLayerOptions } from '../vector/GeoJsonLayer';
 import { lonLatToMerc } from '../vector/geometry';
@@ -112,6 +113,8 @@ export class GeoViewer {
   readonly tilesets: Tiles3DLayer[] = [];
   /** Worker-backed vector pipeline (draped rasterization, queries). */
   readonly vectors = new VectorService();
+  /** Raster overlay layers + rasterized vectors, draped over the base imagery. */
+  readonly overlays = new OverlayCompositor(this.vectors);
   readonly labels: LabelManager;
   readonly vectorLayers: GeoJsonLayer[] = [];
 
@@ -175,7 +178,7 @@ export class GeoViewer {
     this.camera.name = 'GlobeCamera';
 
     this.globe = new Globe(options);
-    this.globe.setOverlaySource(this.vectors);
+    this.globe.setOverlaySource(this.overlays);
     this.scene.add(this.globe.group);
     this.labels = new LabelManager(this.ellipsoid);
     this.labels.heightProvider = (lon, lat) => (this._showGlobe ? this.globe.getHeight(lon, lat) : 0);

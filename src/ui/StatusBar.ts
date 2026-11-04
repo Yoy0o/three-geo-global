@@ -99,6 +99,7 @@ export class StatusBar {
   private updateAttribution(): void {
     const v = this.viewer;
     const parts = [v.globe.imageryProvider.attribution];
+    for (const o of v.overlays.rasterLayers) if (o.visible) parts.push(o.provider.attribution);
     if (v.globe.terrainSource) parts.push(v.globe.terrainSource.attribution);
     for (const layer of v.tilesets) {
       const attrs = layer.tiles.getAttributions?.() ?? [];

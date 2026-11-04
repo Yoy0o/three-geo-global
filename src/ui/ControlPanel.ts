@@ -3,13 +3,21 @@ import { DEG2RAD } from '../core/math';
 import { IMAGERY_PRESETS, findImageryPreset } from '../globe/imagery/presets';
 import { XYZImageryProvider, type ImageryProvider } from '../globe/imagery/ImageryProvider';
 import { tileDebugUniforms } from '../globe/TileMaterial';
-import { AWS_TERRARIUM } from '../globe/terrain/TerrainSource';
+import {
+  AWS_TERRARIUM,
+  cesiumIonTerrain,
+  mapboxTerrain,
+  maptilerTerrain,
+  quantizedMeshFromLayerJson,
+  type TerrainSource,
+} from '../globe/terrain/TerrainSource';
 import type { Tiles3DLayer, TilesetSource } from '../tiles3d/Tiles3DLayer';
 import { lookAtHeadingPitchRange } from '../viewer/cameraMath';
 import type { GeoViewer } from '../viewer/GeoViewer';
 import { h, section, slider, toggle } from './dom';
 import { BOOKMARKS, TILESET_PRESETS, type Bookmark } from './presets';
-import { saveSettings, type Settings } from './settings';
+import { OverlayPanel } from './OverlayPanel';
+import { saveSettings, type Settings, type TerrainChoice } from './settings';
 import { VectorPanel } from './VectorPanel';
 
 /** Builds an imagery provider from saved settings (shared with startup). */
@@ -21,6 +29,37 @@ export function createImagery(settings: Settings): ImageryProvider {
   if (preset.requiresKey === 'tianditu' && !settings.tiandituKey) return IMAGERY_PRESETS[0].create();
   return preset.create(settings.tiandituKey);
 }
+
+/** Resolves the saved terrain choice (some sources need network calls, e.g. Cesium ion). */
+export async function createTerrain(s: Settings): Promise<TerrainSource | null> {
+  switch (s.terrainSource) {
+    case 'none':
+      return null;
+    case 'aws':
+      return AWS_TERRARIUM;
+    case 'mapbox':
+      if (!s.mapboxToken) throw new Error('请填写 Mapbox access token');
+      return mapboxTerrain(s.mapboxToken);
+    case 'maptiler':
+      if (!s.maptilerKey) throw new Error('请填写 MapTiler key');
+      return maptilerTerrain(s.maptilerKey);
+    case 'cesium':
+      if (!s.ionToken) throw new Error('请填写 Cesium ion token');
+      return cesiumIonTerrain(s.ionToken, 1);
+    case 'qm-url':
+      if (!s.quantizedMeshUrl) throw new Error('请填写 quantized-mesh 地址');
+      return quantizedMeshFromLayerJson(s.quantizedMeshUrl, { name: '自定义 quantized-mesh' });
+  }
+}
+
+const TERRAIN_CHOICES: { id: TerrainChoice; name: string }[] = [
+  { id: 'none', name: '无地形（椭球面）' },
+  { id: 'aws', name: 'AWS Terrain Tiles（免 key）' },
+  { id: 'mapbox', name: 'Mapbox Terrain-RGB（需 token）' },
+  { id: 'maptiler', name: 'MapTiler Terrain（需 key）' },
+  { id: 'cesium', name: 'Cesium World Terrain（需 ion token）' },
+  { id: 'qm-url', name: '自定义 quantized-mesh（layer.json）' },
+];
 
 export class ControlPanel {
   readonly root: HTMLElement;
@@ -76,16 +115,20 @@ export class ControlPanel {
     select.value = s.imagery;
 
     const keyInput = h('input', { type: 'password', placeholder: '天地图 tk（浏览器端 key）', value: s.tiandituKey, autocomplete: 'off' });
+    keyInput.addEventListener('change', () => {
+      s.tiandituKey = keyInput.value.trim();
+      this.save();
+    });
     const urlInput = h('input', { type: 'url', placeholder: 'https://{s}.example.com/{z}/{x}/{y}.png', value: s.customImageryUrl });
-    const keyRow = h('div', { class: 'row' }, keyInput);
     const urlRow = h('div', { class: 'row' }, urlInput);
     const apply = h('button', { class: 'btn' }, '应用');
-    const extra = h('div', { class: 'stack' }, keyRow, urlRow, apply);
+    const keys = h('details', { class: 'keys' }, h('summary', {}, '访问凭证：天地图 key（仅存本机）'), keyInput);
+    const extra = h('div', { class: 'stack' }, urlRow, apply);
 
     const refresh = () => {
-      keyRow.hidden = select.value !== 'tianditu-img';
       urlRow.hidden = select.value !== 'custom';
-      apply.hidden = keyRow.hidden && urlRow.hidden;
+      apply.hidden = urlRow.hidden && select.value !== 'tianditu-img';
+      if (select.value === 'tianditu-img') keys.open = true;
     };
     const commit = () => {
       s.imagery = select.value;
@@ -102,26 +145,71 @@ export class ControlPanel {
     });
     apply.addEventListener('click', commit);
     refresh();
-    return section('底图影像', select, extra);
+    const overlays = new OverlayPanel(this.viewer, s, () => this.save(), (t, k) => this.notify(t, k));
+    return section('底图影像', select, extra, keys, overlays.root);
   }
 
   private terrainSection(): HTMLElement {
     const s = this.settings;
+    const select = h('select', { 'aria-label': '地形源' }, ...TERRAIN_CHOICES.map((c) => h('option', { value: c.id }, c.name)));
+    select.value = s.terrainSource;
+    const token = h('input', { type: 'password', autocomplete: 'off' });
+    const url = h('input', { type: 'url', placeholder: 'https://…/layer.json（或其所在目录）', value: s.quantizedMeshUrl });
+    const tokenRow = h('div', { class: 'row' }, token);
+    const urlRow = h('div', { class: 'row' }, url);
+    const apply = h('button', { class: 'btn' }, '应用');
+    const hint = h('p', { class: 'hint' });
+
+    const refresh = () => {
+      const c = select.value as TerrainChoice;
+      tokenRow.hidden = !['mapbox', 'maptiler', 'cesium'].includes(c);
+      urlRow.hidden = c !== 'qm-url';
+      apply.hidden = tokenRow.hidden && urlRow.hidden;
+      token.placeholder = c === 'mapbox' ? 'Mapbox access token' : c === 'maptiler' ? 'MapTiler key' : 'Cesium ion access token';
+      token.value = c === 'mapbox' ? s.mapboxToken : c === 'maptiler' ? s.maptilerKey : c === 'cesium' ? s.ionToken : '';
+      hint.textContent =
+        c === 'cesium' || c === 'qm-url'
+          ? 'quantized-mesh 地形为椭球高，按地理瓦片在 Worker 中重采样到墨卡托网格。'
+          : c === 'none'
+            ? '关闭地形时地表为 WGS84 椭球面。'
+            : '海拔经 EGM96 大地水准面改正为椭球高，可与 3D Tiles 对齐；海面按平均海平面处理。';
+    };
+    const commit = () => {
+      const c = select.value as TerrainChoice;
+      if (c === 'mapbox') s.mapboxToken = token.value.trim();
+      if (c === 'maptiler') s.maptilerKey = token.value.trim();
+      if (c === 'cesium') s.ionToken = token.value.trim();
+      if (c === 'qm-url') s.quantizedMeshUrl = url.value.trim();
+      s.terrainSource = c;
+      s.terrain = c !== 'none';
+      this.save();
+      void this.applyTerrain();
+    };
+    select.addEventListener('change', () => {
+      refresh();
+      if (apply.hidden) commit();
+    });
+    apply.addEventListener('click', commit);
+    refresh();
+
     const exag = slider('高程夸张', { min: 1, max: 5, step: 0.5, value: s.exaggeration, format: (v) => `${v.toFixed(1)}×` }, (v) => {
       s.exaggeration = v;
       this.save();
-      if (s.terrain) this.viewer.globe.setTerrain(AWS_TERRARIUM, v);
+      const current = this.viewer.globe.terrainSource;
+      if (current) this.viewer.globe.setTerrain(current, v);
     });
-    return section(
-      '地形',
-      toggle('全球地形 (AWS Terrarium)', s.terrain, (v) => {
-        s.terrain = v;
-        this.save();
-        this.viewer.globe.setTerrain(v ? AWS_TERRARIUM : null, s.exaggeration);
-      }),
-      exag.root,
-      h('p', { class: 'hint' }, '海拔经 EGM96 大地水准面改正为椭球高，可与 3D Tiles 对齐；海面按平均海平面处理。'),
-    );
+    return section('地形', select, tokenRow, urlRow, apply, exag.root, hint);
+  }
+
+  /** Applies the saved terrain choice, reporting errors in the panel. */
+  async applyTerrain(): Promise<void> {
+    try {
+      const source = await createTerrain(this.settings);
+      this.viewer.globe.setTerrain(source, this.settings.exaggeration);
+      if (source && source !== AWS_TERRARIUM) this.notify(`地形：${source.name}`);
+    } catch (err) {
+      this.notify(`地形加载失败：${(err as Error).message}`, 'error');
+    }
   }
 
   private sceneSection(): HTMLElement {
