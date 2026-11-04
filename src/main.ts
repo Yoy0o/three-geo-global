@@ -3,6 +3,7 @@ import { AWS_TERRARIUM } from './globe/terrain/TerrainSource';
 import { ControlPanel, createImagery } from './ui/ControlPanel';
 import { h } from './ui/dom';
 import { FeaturePopup } from './ui/FeaturePopup';
+import { LevelBar } from './ui/IndoorPanel';
 import { loadSettings } from './ui/settings';
 import { StatusBar } from './ui/StatusBar';
 import { GeoViewer, type ViewPosition } from './viewer/GeoViewer';
@@ -79,15 +80,31 @@ async function main(): Promise<void> {
     'div',
     { class: 'brand' },
     h('strong', {}, 'Three Geo Global'),
-    h('span', {}, '左键拖拽旋转 · 滚轮缩放 · 右键/Ctrl 拖拽倾斜旋转 · 双击飞近'),
+    h('span', {}, '左键拖拽平移 · 滚轮缩放 · 右键拖拽调航向/俯仰 · 双击进入建筑 · 右键/Esc 返回'),
   );
   const popup = new FeaturePopup(viewer);
-  app.append(title, panel.root, status.root, status.compass, popup.root);
+  const levels = new LevelBar(viewer);
+  app.append(title, panel.root, status.root, status.compass, popup.root, levels.root, levels.floors);
   syncHash(viewer);
-  enableFileDrop(app, (files) => void panel.vectorPanel.loadFiles(files));
+  enableFileDrop(app, (files) => {
+    const buildings = files.filter((f) => /\.building\.json$/i.test(f.name));
+    for (const f of buildings) void panel.indoorPanel.loadFile(f);
+    const rest = files.filter((f) => !buildings.includes(f));
+    if (rest.length) void panel.vectorPanel.loadFiles(rest);
+  });
+  window.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || isTyping(e)) return;
+    // Esc first closes the property popup, then steps up one indoor level.
+    if (popup.isOpen) popup.close();
+    else if (viewer.indoor.current) void viewer.indoor.back();
+  });
 
   // ?geojson=<url> loads a GeoJSON layer on startup (repeatable).
   for (const url of params.getAll('geojson')) panel.vectorPanel.load({ url }, !location.hash);
+
+  // ?demo loads the procedural office building; ?building=<url> a building document.
+  if (params.has('demo')) panel.indoorPanel.loadDemo();
+  for (const url of params.getAll('building')) void panel.indoorPanel.loadUrl(url);
 
   // ?tileset=<url> loads a 3D Tiles dataset on startup.
   const tileset = params.get('tileset');
@@ -102,9 +119,14 @@ async function main(): Promise<void> {
   (window as unknown as { viewer: GeoViewer }).viewer = viewer;
 }
 
-/** Drag GeoJSON files anywhere onto the page to load them. */
+function isTyping(e: KeyboardEvent): boolean {
+  const t = e.target as HTMLElement | null;
+  return !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+}
+
+/** Drag GeoJSON (or *.building.json) files anywhere onto the page to load them. */
 function enableFileDrop(app: HTMLElement, onFiles: (files: File[]) => void): void {
-  const overlay = h('div', { class: 'drop-overlay', hidden: true }, h('div', {}, '释放以加载 GeoJSON 文件'));
+  const overlay = h('div', { class: 'drop-overlay', hidden: true }, h('div', {}, '释放以加载 GeoJSON / building.json 文件'));
   app.append(overlay);
   let depth = 0;
   const hasFiles = (e: DragEvent) => !!e.dataTransfer && [...e.dataTransfer.types].includes('Files');

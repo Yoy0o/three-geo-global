@@ -774,3 +774,257 @@ select.field-select {
   min-width: 0;
   accent-color: var(--accent);
 }
+
+/* ---------------------------------------------------------------- markers / top cards (顶牌) */
+
+.marker-layer {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.marker {
+  position: absolute;
+  top: 0;
+  left: 0;
+  will-change: transform;
+  pointer-events: none;
+}
+
+.marker.interactive > * {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.tg-card {
+  --accent: #5aa9ff;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font: 12px/1.3 var(--font);
+  color: var(--text);
+  user-select: none;
+  filter: drop-shadow(0 4px 10px rgba(0, 0, 0, 0.45));
+}
+
+.tg-body {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border-radius: 9px;
+  background: rgba(10, 16, 28, 0.86);
+  border: 1px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  border-left: 3px solid var(--accent);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  white-space: nowrap;
+}
+
+.tg-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+.tg-text {
+  display: flex;
+  flex-direction: column;
+}
+
+.tg-text strong {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.tg-text span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.tg-badge {
+  font-style: normal;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #04101f;
+}
+
+/* Leader line from the card to the anchor (bottom center of the element). */
+.tg-stem {
+  width: 2px;
+  height: 22px;
+  background: linear-gradient(to bottom, var(--accent), transparent);
+}
+
+.tg-stem::after {
+  content: '';
+  display: block;
+  width: 8px;
+  height: 8px;
+  margin: 20px 0 0 -3px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.tg-card.tg-card .tg-stem {
+  margin-bottom: -4px;
+}
+
+.tg-pin .tg-body {
+  padding: 4px 8px;
+  border-radius: 999px;
+  border-left-width: 1px;
+}
+
+.tg-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 30%, transparent);
+}
+
+.tg-tag .tg-body {
+  padding: 2px 8px;
+  border-radius: 6px;
+  border-left-width: 1px;
+  background: rgba(10, 16, 28, 0.72);
+}
+
+.tg-tag .tg-text strong {
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+/* ---------------------------------------------------------------- indoor level bar / floor switcher */
+
+.level-bar {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: calc(100% - 660px);
+  padding: 5px 10px 5px 5px;
+  border-radius: 999px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.level-bar[hidden] {
+  display: none;
+}
+
+.level-back {
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.level-crumbs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.level-crumbs .sep {
+  color: var(--muted);
+}
+
+.crumb {
+  border: none;
+  background: transparent;
+  padding: 2px 4px;
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.crumb:hover {
+  color: var(--text);
+  background: var(--accent-soft);
+}
+
+.crumb.current {
+  color: var(--text);
+  font-weight: 600;
+  cursor: default;
+  background: transparent;
+}
+
+.floor-switcher {
+  position: fixed;
+  left: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  border-radius: 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+
+.floor-switcher[hidden] {
+  display: none;
+}
+
+.floor-btn {
+  min-width: 46px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.floor-btn:hover {
+  border-color: var(--accent);
+}
+
+.floor-btn.active {
+  background: var(--accent);
+  color: #04101f;
+  font-weight: 700;
+}
+
+.feature-popup footer .row {
+  gap: 6px;
+}
+
+@media (max-width: 900px) {
+  .level-bar {
+    top: auto;
+    bottom: 70px;
+    max-width: calc(100% - 24px);
+  }
+}

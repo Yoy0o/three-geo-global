@@ -4,15 +4,18 @@ import {
   HemisphereLight,
   NeutralToneMapping,
   PerspectiveCamera,
+  Quaternion,
   Raycaster,
   Scene,
   Sphere,
   Vector2,
   Vector3,
+  type Object3D,
 } from 'three';
 import { WebGPURenderer } from 'three/webgpu';
 import { float, positionWorldDirection, vec3 } from 'three/tsl';
 import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { atmosphereUniforms, skyColorNode, Z_SCALE } from '../atmosphere/AtmosphereNodes';
@@ -23,14 +26,19 @@ import { clamp, DEG2RAD, smoothstep } from '../core/math';
 import { greenwichMeanSiderealTime, sunDirectionECEF } from '../core/SunPosition';
 import { Globe, type GlobeOptions } from '../globe/Globe';
 import { OverlayCompositor } from '../globe/OverlayCompositor';
+import type { BimEntity } from '../indoor/BimEntity';
+import { IndoorManager } from '../indoor/IndoorManager';
+import { MarkerManager } from '../markers/MarkerManager';
 import { Tiles3DLayer, type LoaderKit, type Tiles3DLayerOptions } from '../tiles3d/Tiles3DLayer';
+import type { NodeMaterialLibrary } from '../tiles3d/nodeMaterials';
 import { GeoJsonLayer, type GeoJsonLayerOptions } from '../vector/GeoJsonLayer';
 import { lonLatToMerc } from '../vector/geometry';
 import { LabelManager } from '../vector/LabelManager';
 import type { FeatureHit } from '../vector/types';
 import { VectorService } from '../vector/VectorService';
 import { cameraDirection, getHeadingPitch, lookAtHeadingPitchRange } from './cameraMath';
-import { GlobeCameraController, type ControllerHost } from './GlobeCameraController';
+import { GlobeCameraController, type AutoOrbitOptions, type ControllerHost } from './GlobeCameraController';
+import { InteractionManager, type PickInfo } from './InteractionManager';
 
 export interface ViewPosition {
   /** Degrees. */
@@ -43,6 +51,27 @@ export interface ViewPosition {
   heading?: number;
   /** Degrees, negative looks down. */
   pitch?: number;
+}
+
+/** Look at a point from a heading / pitch / range (ThingJS `flyTo({ target, horzAngle, vertAngle })`). */
+export interface TargetView {
+  /** Degrees / meters, or a world (ECEF) point. */
+  target: { longitude: number; latitude: number; height?: number } | Vector3;
+  /** Degrees clockwise from north (default: keep the current heading). */
+  heading?: number;
+  /** Degrees, negative looks down (default -45). */
+  pitch?: number;
+  /** Meters from the target (default 500). */
+  range?: number;
+  /** Seconds (default: automatic). */
+  duration?: number;
+}
+
+export interface SphereFlightOptions {
+  /** Multiplies the distance that fits the sphere in view. */
+  rangeScale?: number;
+  /** Closest distance in meters (default 50). */
+  minRange?: number;
 }
 
 export interface GeoViewerOptions extends GlobeOptions {
@@ -83,11 +112,20 @@ export interface FeaturePick {
   position: Cartographic | null;
 }
 
+export interface SurfacePick {
+  point: Vector3;
+  source: 'globe' | 'tiles' | 'entity';
+  distance: number;
+  entity?: BimEntity;
+  tileset?: Tiles3DLayer;
+}
+
 const EARTH_CIRCUMFERENCE = 2 * Math.PI * 6378137;
 
 const _ndc = new Vector2();
 const _v = new Vector3();
 const _dir = new Vector3();
+const _carto = cartographic();
 
 /**
  * WebGPU-first 3D globe viewer.
@@ -117,6 +155,12 @@ export class GeoViewer {
   readonly overlays = new OverlayCompositor(this.vectors);
   readonly labels: LabelManager;
   readonly vectorLayers: GeoJsonLayer[] = [];
+  /** HTML markers / top cards (顶牌) anchored to world positions. */
+  readonly markers: MarkerManager;
+  /** Pointer events resolved to scene objects (click / dblclick / hover with selectors). */
+  readonly interaction: InteractionManager;
+  /** Buildings, floors, rooms and equipment; indoor level navigation. */
+  readonly indoor: IndoorManager;
 
   /** Simulated date driving the sun and star positions. */
   date = new Date();
@@ -131,6 +175,8 @@ export class GeoViewer {
   private readonly raycaster = new Raycaster();
   private readonly cameraCarto: Cartographic = cartographic();
   private loaders: LoaderKit | null = null;
+  private gltfLoader: GLTFLoader | null = null;
+  private tilesetsSuppressed = false;
   private lastTime = -1;
   private fpsFrames = 0;
   private fpsTime = 0;
@@ -188,14 +234,32 @@ export class GeoViewer {
     this.scene.background = new Color(0x000000);
     this.scene.backgroundNode = skyColorNode(positionWorldDirection).add(vec3(0.0006, 0.0008, 0.0016)).mul(float(1));
 
+    this.markers = new MarkerManager(this.container, renderer.domElement);
+    this.indoor = new IndoorManager({
+      ellipsoid: this.ellipsoid,
+      camera: this.camera,
+      markers: this.markers,
+      // Buildings follow the terrain once it is reasonably detailed (no floating on coarse estimates).
+      groundHeight: (lon, lat) => (this._showGlobe ? this.globe.getHeight(lon, lat, 150) : 0),
+      flyToSphere: (sphere, heading, pitch, rangeScale, duration) => this.flyToSphere(sphere, heading, pitch, duration, { rangeScale, minRange: 4 }),
+      cameraHeading: () => this.getView().heading,
+      setTilesetsVisible: (visible) => this.setTilesetsSuppressed(!visible),
+      loadModel: (uri) => this.loadModel(uri),
+      followMove: (delta) => this.controller.translate(delta),
+    });
+    this.scene.add(this.indoor.root);
+
     const host: ControllerHost = {
       camera: this.camera,
       ellipsoid: this.ellipsoid,
       domElement: renderer.domElement,
       pick: (ndc) => this.pick(ndc)?.point ?? null,
-      groundHeight: (lon, lat) => (this._showGlobe ? (this.globe.getHeight(lon, lat) ?? 0) : 0),
+      groundHeight: (lon, lat) => this.collisionGround(lon, lat),
     };
     this.controller = new GlobeCameraController(host);
+    this.interaction = new InteractionManager({ domElement: renderer.domElement, pickAt: (x, y) => this.pickAt(x, y) });
+    this.controller.doubleClickHandler = (e) => this.interaction.dispatchDoubleClick(e);
+    this.installIndoorBehaviors();
 
     const v = options.initialView ?? { longitude: 110, latitude: 28, height: 1.8e7 };
     this.setView(v);
@@ -257,14 +321,44 @@ export class GeoViewer {
     return this.controller.flyTo({ position, heading: (v.heading ?? 0) * DEG2RAD, pitch: (v.pitch ?? -90) * DEG2RAD }, duration);
   }
 
+  /** Flies to look at a target from a heading / pitch / range. */
+  flyToTarget(view: TargetView): Promise<void> {
+    const t = view.target;
+    const target = t instanceof Vector3 ? t.clone() : this.ellipsoid.cartographicToCartesian(t.longitude * DEG2RAD, t.latitude * DEG2RAD, t.height ?? 0);
+    const heading = (view.heading ?? this.getView().heading) * DEG2RAD;
+    const pitch = (view.pitch ?? -45) * DEG2RAD;
+    const position = new Vector3();
+    lookAtHeadingPitchRange(this.ellipsoid, target, heading, pitch, view.range ?? 500, position, new Quaternion());
+    return this.controller.flyTo({ position, heading, pitch }, view.duration);
+  }
+
   /** Fly so that a bounding sphere fills the view, looking at it from the south-east at 35 degrees. */
-  flyToSphere(sphere: Sphere, heading = -30, pitch = -35, duration?: number): Promise<void> {
+  flyToSphere(sphere: Sphere, heading = -30, pitch = -35, duration?: number, options: SphereFlightOptions = {}): Promise<void> {
     const fov = this.camera.getEffectiveFOV() * DEG2RAD;
-    const range = Math.max(sphere.radius / Math.sin(fov / 2), 50) * 1.15;
+    const range = Math.max((sphere.radius / Math.sin(fov / 2)) * (options.rangeScale ?? 1), options.minRange ?? 50) * 1.15;
     const position = new Vector3();
     const q = this.camera.quaternion.clone();
     lookAtHeadingPitchRange(this.ellipsoid, sphere.center, heading * DEG2RAD, pitch * DEG2RAD, range, position, q);
     return this.controller.flyTo({ position, heading: heading * DEG2RAD, pitch: pitch * DEG2RAD }, duration);
+  }
+
+  /** Flies to frame a building, floor, room or thing (ThingJS `camera.fit(obj)`). */
+  flyToEntity(entity: BimEntity, options: { heading?: number; pitch?: number; rangeScale?: number; duration?: number } = {}): Promise<void> {
+    const sphere = entity.worldBounds();
+    if (!sphere) return Promise.resolve();
+    return this.flyToSphere(sphere, options.heading ?? this.getView().heading, options.pitch ?? -40, options.duration, {
+      rangeScale: options.rangeScale ?? 1.5,
+      minRange: 4,
+    });
+  }
+
+  /** Orbits the camera around the view center (or a point) until interrupted (ThingJS `rotateAround`). */
+  startAutoOrbit(options?: AutoOrbitOptions): Promise<void> {
+    return this.controller.startAutoOrbit(options);
+  }
+
+  stopAutoOrbit(): void {
+    this.controller.stopAutoOrbit();
   }
 
   /** Rotates the view back to north-up around the point at the screen center. */
@@ -273,7 +367,7 @@ export class GeoViewer {
     const delta = -(((heading + 180) % 360) - 180) * DEG2RAD;
     const pivot = this.pick(new Vector2(0, 0))?.point;
     if (pivot) {
-      this.controller.rotateHeadingAround(pivot, delta);
+      void this.controller.rotateHeadingAround(pivot, delta);
     } else {
       const v = this.getView();
       void this.flyTo({ ...v, heading: 0 }, 0.8);
@@ -296,27 +390,43 @@ export class GeoViewer {
   // ---------------------------------------------------------------------------
   // Picking
 
-  /** Surface hit (3D Tiles or globe) at normalized device coordinates. */
-  pick(ndc: Vector2): { point: Vector3; source: 'globe' | 'tiles' } | null {
+  /** Closest surface hit (buildings, 3D Tiles or globe) at normalized device coordinates. */
+  pick(ndc: Vector2): SurfacePick | null {
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera(ndc, this.camera);
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (this.raycaster as any).firstHitOnly = true;
-    let best: { point: Vector3; source: 'globe' | 'tiles' } | null = null;
-    let bestDist = Infinity;
+    let best: SurfacePick | null = null;
+    const entity = this.indoor.pick(this.raycaster);
+    if (entity) best = { point: entity.point.clone(), source: 'entity', distance: entity.distance, entity: entity.entity };
     for (const layer of this.tilesets) {
-      if (!layer.visible || !layer.ready) continue;
+      if (!layer.active || !layer.ready) continue;
       const hits = this.raycaster.intersectObject(layer.group, true);
-      if (hits.length > 0 && hits[0].distance < bestDist) {
-        bestDist = hits[0].distance;
-        best = { point: hits[0].point.clone(), source: 'tiles' };
+      if (hits.length > 0 && hits[0].distance < (best?.distance ?? Infinity)) {
+        best = { point: hits[0].point.clone(), source: 'tiles', distance: hits[0].distance, tileset: layer };
       }
     }
     if (this._showGlobe) {
       const g = this.globe.raycast(this.raycaster.ray);
-      if (g && g.distance < bestDist) best = { point: g.point, source: 'globe' };
+      if (g && g.distance < (best?.distance ?? Infinity)) best = { point: g.point, source: 'globe', distance: g.distance };
     }
     return best;
+  }
+
+  /** What lies under a client-space pixel (used by the interaction manager). */
+  pickAt(clientX: number, clientY: number): PickInfo {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    _ndc.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+    const hit = this.pick(_ndc);
+    return {
+      kind: hit ? hit.source : 'none',
+      entity: hit?.entity ?? null,
+      tileset: hit?.tileset ?? null,
+      point: hit?.point ?? null,
+      cartographic: hit ? this.ellipsoid.cartesianToCartographic(hit.point) : null,
+      clientX,
+      clientY,
+    };
   }
 
   /** Cartographic position (radians) under a client-space pixel. */
@@ -327,6 +437,65 @@ export class GeoViewer {
     return hit ? this.ellipsoid.cartesianToCartographic(hit.point) : null;
   }
 
+  /**
+   * Ground height for camera collision. Only terrain whose grid spacing is
+   * fine relative to the camera's height counts: coarse or interpolated
+   * surfaces (common while streaming) would otherwise shove the camera up.
+   */
+  private collisionGround(lon: number, lat: number): number | null {
+    if (!this._showGlobe) return 0;
+    const coarse = this.globe.getHeight(lon, lat);
+    if (coarse === null) return null;
+    const c = this.ellipsoid.cartesianToCartographic(this.camera.position, _carto);
+    const above = (c?.height ?? 0) - coarse;
+    return this.globe.getHeight(lon, lat, Math.max(50, above * 1.5));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Indoor defaults (ThingJS level behavior)
+
+  /**
+   * Double click enters the next level under the cursor (building → floor →
+   * room / thing), right click or Esc goes back, hovering highlights.
+   */
+  private installIndoorBehaviors(): void {
+    const indoor = this.indoor;
+    this.interaction.on(
+      'dblclick',
+      (e) => {
+        const next = indoor.nextLevel(e.entity!);
+        if (!next) return;
+        e.preventDefault();
+        void indoor.enter(next);
+      },
+      { selector: '.building, .floor, .room, .thing, .element', tag: 'indoor' },
+    );
+    this.interaction.on(
+      'rightclick',
+      () => {
+        if (indoor.current) void indoor.back();
+      },
+      { tag: 'indoor' },
+    );
+    this.interaction.on('click', (e) => indoor.select(e.entity ? selectTarget(e.entity, indoor.current) : null), { tag: 'indoor' });
+    // Hover picking costs a ray cast per frame of pointer motion: only while buildings exist.
+    let hoverOn = false;
+    indoor.events.on('buildings-changed', (buildings) => {
+      const want = buildings.length > 0;
+      if (want === hoverOn) return;
+      hoverOn = want;
+      if (want) {
+        const selector = '.building, .room, .thing, .element';
+        this.interaction.on('mouseenter', (e) => indoor.setHovered(hoverTarget(e.object!, indoor.current)), { selector, tag: 'indoor-hover' });
+        this.interaction.on('mouseleave', () => indoor.setHovered(null), { selector, tag: 'indoor-hover' });
+      } else {
+        this.interaction.off('mouseenter', 'indoor-hover');
+        this.interaction.off('mouseleave', 'indoor-hover');
+        indoor.setHovered(null);
+      }
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // 3D Tiles
 
@@ -334,6 +503,7 @@ export class GeoViewer {
     const layer = new Tiles3DLayer(options, this.getLoaders(), this.ellipsoid);
     layer.tiles.setCamera(this.camera);
     layer.tiles.setResolutionFromRenderer(this.camera, this.renderer as never);
+    layer.suppressed = this.tilesetsSuppressed;
     this.scene.add(layer.group);
     this.tilesets.push(layer);
     this.events.emit('tilesets-changed', this.tilesets);
@@ -346,6 +516,12 @@ export class GeoViewer {
     this.tilesets.splice(i, 1);
     layer.dispose();
     this.events.emit('tilesets-changed', this.tilesets);
+  }
+
+  private setTilesetsSuppressed(suppressed: boolean): void {
+    if (suppressed === this.tilesetsSuppressed) return;
+    this.tilesetsSuppressed = suppressed;
+    for (const layer of this.tilesets) layer.suppressed = suppressed;
   }
 
   // ---------------------------------------------------------------------------
@@ -420,9 +596,28 @@ export class GeoViewer {
       const dracoLoader = new DRACOLoader();
       const ktxLoader = new KTX2Loader();
       ktxLoader.detectSupport(this.renderer as never);
-      this.loaders = { dracoLoader, ktxLoader, meshoptDecoder: MeshoptDecoder };
+      this.loaders = {
+        dracoLoader,
+        ktxLoader,
+        meshoptDecoder: MeshoptDecoder,
+        nodeLibrary: (this.renderer as unknown as { library: NodeMaterialLibrary }).library,
+      };
     }
     return this.loaders;
+  }
+
+  /** Loads a glTF / GLB (Draco, KTX2 and meshopt supported) for building and equipment models. */
+  async loadModel(uri: string): Promise<Object3D> {
+    if (!this.gltfLoader) {
+      const kit = this.getLoaders();
+      const loader = new GLTFLoader();
+      loader.setDRACOLoader(kit.dracoLoader);
+      loader.setKTX2Loader(kit.ktxLoader);
+      loader.setMeshoptDecoder(kit.meshoptDecoder);
+      this.gltfLoader = loader;
+    }
+    const gltf = await this.gltfLoader.loadAsync(uri);
+    return gltf.scene;
   }
 
   // ---------------------------------------------------------------------------
@@ -453,9 +648,12 @@ export class GeoViewer {
     const t0 = performance.now();
     if (this._showGlobe) this.globe.update(this.camera, this.container.clientHeight);
     for (const layer of this.tilesets) layer.update();
+    this.indoor.update(dt);
+    this.interaction.update();
     this.labels.update(this.camera, this.container.clientWidth, this.container.clientHeight, dt);
 
     this.renderer.render(this.scene, this.camera);
+    this.markers.update(this.camera, this.container.clientWidth, this.container.clientHeight);
     this.updateStats(dt, performance.now() - t0);
   }
 
@@ -482,7 +680,7 @@ export class GeoViewer {
     const cam = this.camera;
     const sun = sunDirectionECEF(this.date, _v);
     u.lightDirection.value.copy(sun);
-    const up = this.ellipsoid.geodeticSurfaceNormal(cam.position, new Vector3());
+    const up = this.ellipsoid.geodeticNormal(cam.position, new Vector3());
     if (this._lighting) {
       u.sunDirection.value.copy(sun);
     } else {
@@ -504,7 +702,7 @@ export class GeoViewer {
     const night = this._lighting ? smoothstep(0.05, -0.2, sunAltitude) : 0;
     this.stars.uniforms.visibility.value = this._atmosphere ? Math.max(space, night) : 1;
 
-    // Lights for 3D Tiles (globe tiles shade themselves).
+    // Lights for 3D Tiles and buildings (globe tiles shade themselves).
     if (this._lighting) {
       this.sunLight.position.copy(sun);
       const day = smoothstep(-0.15, 0.2, sunAltitude);
@@ -557,14 +755,31 @@ export class GeoViewer {
     void this.renderer.setAnimationLoop(null);
     this.resizeObserver.disconnect();
     this.controller.dispose();
+    this.interaction.dispose();
     for (const layer of [...this.tilesets]) this.removeTileset(layer);
     for (const layer of [...this.vectorLayers]) this.removeGeoJson(layer);
+    this.indoor.dispose();
+    this.markers.dispose();
     this.labels.dispose();
     this.vectors.dispose();
     this.globe.dispose();
     this.renderer.dispose();
     this.renderer.domElement.remove();
   }
+}
+
+/** What a single click selects at the current level. */
+function selectTarget(hit: BimEntity, current: BimEntity | null): BimEntity {
+  const building = hit.closest('building');
+  if (building && current?.closest('building') !== building) return building;
+  return hit;
+}
+
+/** What hovering should highlight at the current level (whole buildings from outside). */
+function hoverTarget(hit: BimEntity, current: BimEntity | null): BimEntity | null {
+  const building = hit.closest('building');
+  if (building && current?.closest('building') !== building) return building;
+  return hit.type === 'building' ? null : hit;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

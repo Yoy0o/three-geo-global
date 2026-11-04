@@ -15,6 +15,7 @@ import type { Tiles3DLayer, TilesetSource } from '../tiles3d/Tiles3DLayer';
 import { lookAtHeadingPitchRange } from '../viewer/cameraMath';
 import type { GeoViewer } from '../viewer/GeoViewer';
 import { h, section, slider, toggle } from './dom';
+import { IndoorPanel } from './IndoorPanel';
 import { BOOKMARKS, TILESET_PRESETS, type Bookmark } from './presets';
 import { OverlayPanel } from './OverlayPanel';
 import { saveSettings, type Settings, type TerrainChoice } from './settings';
@@ -64,6 +65,7 @@ const TERRAIN_CHOICES: { id: TerrainChoice; name: string }[] = [
 export class ControlPanel {
   readonly root: HTMLElement;
   readonly vectorPanel: VectorPanel;
+  readonly indoorPanel: IndoorPanel;
   private readonly layerList = h('div', { class: 'layer-list' });
   private readonly message = h('div', { class: 'panel-message', role: 'status' });
 
@@ -73,14 +75,17 @@ export class ControlPanel {
   ) {
     const collapse = h('button', { class: 'panel-toggle', title: '收起 / 展开面板', 'aria-label': '收起或展开面板' }, '☰');
     this.vectorPanel = new VectorPanel(viewer, (text, kind) => this.notify(text, kind));
+    this.indoorPanel = new IndoorPanel(viewer, (text, kind) => this.notify(text, kind));
     const body = h(
       'div',
       { class: 'panel-body' },
       this.basemapSection(),
       this.terrainSection(),
       this.vectorPanel.root,
+      this.indoorPanel.root,
       this.sceneSection(),
       this.tilesSection(),
+      this.cameraSection(),
       this.bookmarkSection(),
       this.debugSection(),
     );
@@ -386,6 +391,36 @@ export class ControlPanel {
     const clamp = h('button', { class: 'icon-btn', title: '贴地：把图层中心抬到地形高度' }, '⤓');
     clamp.addEventListener('click', () => this.clampToTerrain(layer));
     return h('div', { class: 'layer-row' }, vis, h('span', { class: 'layer-name', title: layer.name }, layer.name), offset, clamp, fly, remove);
+  }
+
+  /** Camera controls (ThingJS "控制交互"): orbit pivot, pitch limit, inertia, auto orbit. */
+  private cameraSection(): HTMLElement {
+    const c = this.viewer.controller;
+    const pivot = h(
+      'select',
+      { 'aria-label': '右键旋转中心' },
+      h('option', { value: 'center' }, '右键绕屏幕中心旋转'),
+      h('option', { value: 'cursor' }, '右键绕光标处旋转'),
+    );
+    pivot.value = c.orbitPivot;
+    pivot.addEventListener('change', () => (c.orbitPivot = pivot.value as 'center' | 'cursor'));
+    const maxTilt = slider(
+      '最大倾斜',
+      { min: 10, max: 88, step: 1, value: 90 + c.pitchRangeDeg[1], format: (v) => `${v.toFixed(0)}°` },
+      (v) => (c.pitchRangeDeg = [c.pitchRangeDeg[0], -(90 - v)]),
+    );
+    const orbit = h('button', { class: 'btn ghost', title: '绕屏幕中心点匀速环绕；任意操作即停止' }, '环绕浏览');
+    orbit.addEventListener('click', () => {
+      if (c.isAutoOrbiting) this.viewer.stopAutoOrbit();
+      else void this.viewer.startAutoOrbit({ degreesPerSecond: 12 });
+    });
+    return section(
+      '相机',
+      pivot,
+      maxTilt.root,
+      h('div', { class: 'row' }, toggle('惯性', c.inertia, (on) => (c.inertia = on)), orbit),
+      h('p', { class: 'hint' }, '右键拖拽：水平调航向、垂直调俯仰；滚轮缩放保持当前航向与俯仰。'),
+    );
   }
 
   private bookmarkSection(): HTMLElement {
