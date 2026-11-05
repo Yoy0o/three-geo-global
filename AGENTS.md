@@ -33,7 +33,8 @@
 ```
 src/
 ├─ core/        椭球（Ellipsoid）、测地学（geodesy，Worker 可用、无 three 依赖）、EGM96、太阳位置、EventEmitter
-├─ globe/       四叉树地球：Globe（调度）、GlobeTile（状态）、TileMaterial（TSL）、Worker 构网、影像源、地形源
+├─ globe/       四叉树地球：Globe（调度）、GlobeTile（状态）、tileSelection（选择规则纯函数）、
+│               tileMeshLayout（网格索引布局，Worker 与象限填充共用）、TileMaterial（TSL）、Worker 构网、影像源、地形源
 │  └─ terrain/  地形源描述、quantized-mesh 解码、terrainTiling（主线程与 Worker 共用的分块 / 插值规则）
 ├─ atmosphere/  大气散射 TSL 节点、星空
 ├─ tiles3d/     3D Tiles 图层；nodeMaterials（节点材质转换 + WebGPU 渐显）
@@ -44,7 +45,7 @@ src/
 ├─ viewer/      GeoViewer（总装、拾取、帧循环）、GlobeCameraController、cameraMath、CameraFlight、
 │               InteractionManager（click / dblclick / rightclick / hover + 选择器 + 标签）
 └─ ui/          面板（ControlPanel / IndoorPanel / VectorPanel / OverlayPanel）、状态栏、属性弹窗、层级条
-tests/          vitest：geo / camera / terrain / vector / indoor
+tests/          vitest：geo / camera / terrain / tileSelection / tileMeshLayout / requestScheduler / vector / indoor
 docs/agents/    子系统规范（本文档的展开）
 ```
 
@@ -106,7 +107,11 @@ docs/agents/    子系统规范（本文档的展开）
 
 ## 4. 子系统要点
 
-- **地球 Globe**：屏幕空间误差驱动的四叉树。瓦片有网格即可渲染；影像不足时用祖先影像放大顶替，新影像到达后交叉淡入。子瓦片可以先用精确祖先的高度插值出临时网格，最多跨 3 级。地形取数比网格层级低 3 级（一张 256 px 地形图服务 8×8 个网格瓦片，不损失精度）。
+- **地球 Globe**：屏幕空间误差驱动的四叉树。
+  - 瓦片有网格即可渲染；影像不足时用祖先影像放大顶替，新影像到达后交叉淡入。
+  - 子瓦片可以先用精确祖先的高度插值出临时网格，最多跨 3 级。地形取数比网格层级低 3 级（一张 256 px 地形图服务 8×8 个网格瓦片，不损失精度）。
+  - 选择规则借鉴 CesiumJS：每块瓦片记住上一帧的选择结果。缩小时，父瓦片要等自身影像和地形不比子孙差才替换它们（不丢细节守卫）。新进入视野、还没有网格的子瓦片，由父瓦片的对应象限暂时顶替（象限填充）。
+  - 规则写在 `tileSelection.ts`，详见 tile-loading.md §2。
 - **3D Tiles**：`NodeMaterialPlugin` 把材质转为节点材质；`TilesFadePlugin` 的材质管理器换成 `NodeFadeMaterialManager`（TSL dither 遮罩）；隐藏瓦片在 192 MB 显存预算内保留，3 s 后才释放。
 - **相机**：左键抓地平移；右键横向调航向、纵向调俯仰（默认绕屏幕中心点）；滚轮缩放到光标并保持航向和俯仰；另有环绕巡航、俯仰范围、各类开关、双击钩子。
 - **室内 / BIM**：层级为 地球 → 建筑 → 楼层 → 房间 / 设备。双击进入，右键单击或 Esc 返回，单击选中，悬停高亮。进出层级会触发 `beforeEnterLevel` / `enterLevel` / `leaveLevel` 事件。格式定义见 [indoor-bim.md](docs/agents/indoor-bim.md)。
@@ -117,7 +122,7 @@ docs/agents/    子系统规范（本文档的展开）
 
 | 任务 | 做法 |
 | --- | --- |
-| 新增影像源 | 实现 `ImageryProvider`（`requestImage` 返回 `ImageBitmap`，404 返回 null），在 `imagery/presets.ts` 注册。不要绕开 Globe 的通道。 |
+| 新增影像源 | 实现 `ImageryProvider`（`requestImage` 返回 `ImageBitmap`，404 返回 null），在 `imagery/presets.ts` 注册。只支持 HTTP/1.1 的服务要声明 `maxRequestsPerHost: 6`。不要绕开 Globe 的通道。 |
 | 新增栅格地形源 | 在 `TerrainSource.ts` 描述，写明 `tileSize`（决定取数层级偏移）和 `heightReference`。 |
 | 新增 BIM 字段 | 先改 `indoor/schema.ts` 的类型和 `parseBuildingDoc` 校验，再改 `Building` 构建，最后同步 [indoor-bim.md](docs/agents/indoor-bim.md) 并补 `tests/indoor.test.ts`。 |
 | 新增交互行为 | 用 `viewer.interaction.on(...)` 并带上 `tag`，方便整体注销；需要阻止默认行为时调用 `preventDefault()`。 |
@@ -147,4 +152,12 @@ docs/agents/    子系统规范（本文档的展开）
 - **建筑贴地后取景偏移**：页面刚打开就进入建筑时，飞行目标还是建筑贴地前的位置。贴地平移必须同步给相机（`followMove` 调用 `controller.translate`）。
 - **告警被避让隐藏**：重要信息（卡片样式）不能参与避让，只作为障碍物。
 - **three 射线检测不看 `visible`**：拾取后要自行过滤不可见的对象（见 `IndoorManager.pick`）。
+- **缩放闪烁：淡入从过期画面开始**：渲染循环先置了 `visible` 和 `lastRenderedFrame` 再判断"上一帧是否在屏幕上"，结果对新上屏的瓦片永远成立，瓦片会从很久以前显示过的粗影像开始淡入。判断"上一帧是否在屏幕上"必须在更新这两个字段之前做（`showNewTile`）。
+- **缩放闪烁：缩小时先模糊再变清晰**：父瓦片的影像还没加载就替换了清晰的子瓦片。必须走不丢细节守卫（`losesDetail`），不要绕过 `TileSelection` 直接按 SSE 决定。
+- **缩放闪烁：父子来回切换**：子瓦片刚进入视野时还没有网格，父瓦片被迫退回，下一帧又细化。现在靠视野外兄弟瓦片预建网格、本地构网的独立并发额度，以及象限填充来避免。
+- **取消请求不等于释放**：只打取消标记时，槽位和 HTTP 连接要等网络返回才释放；地形服务多为 HTTP/1.1，每个域名约 6 个连接，过期请求会把细化卡住几秒。取消必须立即归还槽位，并中止没人等待的下载。
+- **地形跳动**：临时网格（祖先数据插值）和精确网格在山区可以相差数百米，层级切换时直接换网格，倾斜视角下画面会错动。换网格和父子替换都要走地形渐变（`startMorph`，tile-loading.md §2），不要直接把 `material.morph` 置 1 了事。
+- **TSL 纹理槽被合并**：three 按哈希合并 uniform，纹理节点的哈希是编译时所持纹理的 uuid。两个 `materialReference(..., 'texture')` 在编译时指向同一张纹理，就会共用一个绑定，之后各自赋不同纹理也没用。瓦片的交叉淡入因此一直在混合"旧画面 + 缩小的旧画面"（重影、错位副本），这是加载闪烁的根因。需要同时采样多张纹理时用 `TileMaterial.textureReference` 这种固定独立哈希的写法。
+- **影像逐格闪烁**：每块瓦片影像一到就各自淡入，祖先影像逐级到达时还会连续淡入好几次，画面像棋盘一样闪。屏幕上的瓦片换影像要走 `updateShownImagery`（合并中间层级、兄弟成组揭示，tile-loading.md §2），不要在影像到达时直接 `resolveImagery(tile, true)`。
+- **HTTP/1.1 影像源排队失控**：浏览器每个域名只开约 6 个连接，多派发的请求在浏览器里先来先服务，优先级失效，屏幕中心要等十几秒才清晰。HTTP/1.1 的源（如 `server.arcgisonline.com`）必须在预设里声明 `maxRequestsPerHost`，见 tile-loading.md §3.1。
 - **Windows 环境**：`python` 可能只是应用商店的占位程序，脚本请用 Node；Bash 中使用 POSIX 路径。
