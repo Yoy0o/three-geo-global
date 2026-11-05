@@ -81,6 +81,10 @@ export class StatusBar {
     const g = v.globe.stats;
     let tilesText = `瓦片 ${g.rendered} / 缓存 ${g.cached} · L${g.maxLevel}`;
     if (g.waitingImagery > 0) tilesText += ` · 待影像 ${g.waitingImagery}`;
+    // Finer tiles kept on screen until a coarser one can replace them without blurring.
+    if (g.keptForDetail > 0) tilesText += ` · 保留 ${g.keptForDetail}`;
+    // Loaded imagery waiting to be revealed together with its siblings.
+    if (g.heldImagery > 0) tilesText += ` · 待显示 ${g.heldImagery}`;
     let busy = g.loading > 0;
     for (const t of v.tilesets) {
       const ts = (t.tiles as unknown as { stats: { visible?: number; downloading?: number; parsing?: number } }).stats;

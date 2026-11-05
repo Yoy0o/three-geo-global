@@ -12,6 +12,7 @@ import {
   PerspectiveCamera,
   Ray,
   SRGBColorSpace,
+  type Sphere,
   Texture,
   Vector3,
   Vector4,
@@ -20,13 +21,15 @@ import { Ellipsoid, cartographic, type Cartographic } from '../core/Ellipsoid';
 import { geodeticNormal, geodeticToEcef, isScaledSpacePointVisible, WGS84_A } from '../core/geodesy';
 import { clamp, wrapPi } from '../core/math';
 import { GlobeTile, SharedTexture, type LoadChannel } from './GlobeTile';
-import { createTileMaterial, EMPTY_OVERLAY, type TileMaterial } from './TileMaterial';
+import { createTileMaterial, EMPTY_OVERLAY, MORPH_ATTRIBUTE, type TileMaterial } from './TileMaterial';
 import type { TileOverlaySource } from './overlay';
 import { MERCATOR_MAX_LATITUDE, WebMercatorTilingScheme } from './TilingScheme';
 import { isAbortError, TileWorkerPool } from './TileWorkerPool';
 import type { ImageryProvider } from './imagery/ImageryProvider';
 import { isQuantizedMesh, type TerrainSource } from './terrain/TerrainSource';
 import { rasterSourceTile, terrainLevelOffset } from './terrain/terrainTiling';
+import { extractQuads, morphDeltas, quadrantQuads, tileVertexCount } from './tileMeshLayout';
+import { childUvTransform, fogRelaxedError, horizonFogDensity, imagerySwitchDue, selectionIn, TileSelection, wouldLoseDetail } from './tileSelection';
 import type { BuiltTile, UpsampleSource } from './workerProtocol';
 
 export interface GlobeOptions {
@@ -43,8 +46,27 @@ export interface GlobeOptions {
   /** Grid cells per tile edge. */
   segments?: number;
   maxAnisotropy?: number;
-  /** Seconds to cross-fade from a magnified ancestor to a tile's own imagery (0 = pop in). */
+  /** Seconds to cross-fade to better imagery (a sharper ancestor or the tile's own; 0 = pop in). Default 0.5. */
   fadeDuration?: number;
+  /**
+   * Seconds to morph terrain from the surface that was on screen to a tile's
+   * new mesh (interim to exact terrain, parent to children, children to
+   * parent), so level-of-detail changes do not make the ground jump. 0 = snap.
+   */
+  morphDuration?: number;
+  /**
+   * Horizon fog (CesiumJS): with the camera low and looking towards the
+   * horizon, tiles in the haze refine less; a tile in full fog needs
+   * `1 + factor` times `maxScreenSpaceError` to refine. 0 disables. Default 1.
+   */
+  fogScreenSpaceErrorFactor?: number;
+  /**
+   * Build interpolated meshes for the children of refined tiles that are just
+   * outside the view, so panning or zooming out does not fall back to the
+   * parent when they come into view (CesiumJS `preloadSiblings`, limited to
+   * meshes that need no download). Default true.
+   */
+  preloadSiblings?: boolean;
 }
 
 export interface GlobeStats {
@@ -57,6 +79,12 @@ export interface GlobeStats {
   maxLevel: number;
   /** Rendered tiles still showing a magnified ancestor or the placeholder. */
   waitingImagery: number;
+  /** Rendered tiles finer than needed, kept until a coarser ancestor can replace them without losing detail. */
+  keptForDetail: number;
+  /** Parent quadrants drawn in place of children whose mesh is not ready yet. */
+  fills: number;
+  /** Rendered tiles holding back better imagery, to reveal it together with their siblings (or with sharper ancestors). */
+  heldImagery: number;
 }
 
 type ChannelKind = 'geo' | 'img' | 'ovl';
@@ -78,8 +106,12 @@ const TERRAIN_MAX_HEIGHT = 8900;
 const TERRAIN_MIN_HEIGHT = -120;
 
 // Request priority buckets (lower loads first). See docs/agents/tile-loading.md.
-/** Geometry of a tile that blocks refinement. */
-const B_REFINE = 0;
+/**
+ * Content that blocks a level-of-detail change: geometry of a child that keeps
+ * its parent from refining, or imagery / terrain a tile needs before it can
+ * replace sharper descendants (zooming out).
+ */
+const B_BLOCKING = 0;
 /** Imagery of an intermediate ancestor: a cheap, sharper fallback for many tiles at once. */
 const B_ANCHOR = 1;
 /** Imagery of a rendered tile that currently shows a much coarser fallback. */
@@ -102,6 +134,8 @@ const APPLY_BUDGET = 16;
 const APPLY_BUDGET_MS = 6;
 /** In-flight loads no longer wanted for this many frames are cancelled. */
 const STALE_FRAMES = 20;
+/** Concurrent geometry jobs that need no download (interpolated or flat meshes). */
+const LOCAL_GEOMETRY_LIMIT = 32;
 
 const _projScreen = new Matrix4();
 const _p = [0, 0, 0];
@@ -142,19 +176,28 @@ function terrainAffinity(terrain: TerrainSource, level: number, x: number, y: nu
  *   does not wait on the network; the exact terrain replaces them later;
  * - requests are sorted into priority buckets, then by distance from the view
  *   center (foveated), so what the user looks at loads first;
- * - finished loads are applied under a per-frame budget.
+ * - finished loads are applied under a per-frame budget;
+ * - selection remembers the previous frame (CesiumJS): a coarser tile replaces
+ *   its descendants only once it shows as much detail as they did, so zooming
+ *   out never flashes a blurry ancestor.
  */
 export class Globe {
   readonly group = new Group();
   readonly scheme = new WebMercatorTilingScheme();
   readonly ellipsoid = Ellipsoid.WGS84;
-  readonly stats: GlobeStats = { rendered: 0, cached: 0, loading: 0, queued: 0, maxLevel: 0, waitingImagery: 0 };
+  readonly stats: GlobeStats = { rendered: 0, cached: 0, loading: 0, queued: 0, maxLevel: 0, waitingImagery: 0, keptForDetail: 0, fills: 0, heldImagery: 0 };
 
   maxScreenSpaceError: number;
   maxCachedTiles: number;
   maxConcurrentLoads: number;
   maxConcurrentGeometry: number;
   fadeDuration: number;
+  /** See `GlobeOptions.morphDuration` (seconds, 0 disables). */
+  morphDuration: number;
+  /** See `GlobeOptions.fogScreenSpaceErrorFactor` (0 disables). */
+  fogScreenSpaceErrorFactor: number;
+  /** See `GlobeOptions.preloadSiblings`. */
+  preloadSiblings: boolean;
   /** Stop refining and loading (debug). */
   freeze = false;
   /** Called (at most a few times per provider) when imagery requests fail. */
@@ -176,8 +219,12 @@ export class Globe {
   private readonly active: Record<ChannelKind, Set<GlobeTile>> = { geo: new Set(), img: new Set(), ovl: new Set() };
   private ready: ReadyItem[] = [];
   private readonly fading = new Set<GlobeTile>();
+  private readonly morphing = new Set<GlobeTile>();
   private renderList: GlobeTile[] = [];
   private prevRenderList: GlobeTile[] = [];
+  /** Quadrant meshes drawn this frame for children without a mesh yet (see `GlobeTile.fills`). */
+  private fillList: Mesh[] = [];
+  private prevFillList: Mesh[] = [];
   private frame = 0;
   private now = 0;
   private imageryGen = 0;
@@ -195,6 +242,8 @@ export class Globe {
   private horizonCulling = true;
   private sseFactor = 1;
   private halfFovDiagonal = 0.6;
+  /** Horizon fog density for this frame (per meter, 0 = none). */
+  private fogDensity = 0;
 
   // Polar caps.
   private readonly caps: Mesh[] = [];
@@ -211,7 +260,10 @@ export class Globe {
     this.maxConcurrentGeometry = options.maxConcurrentGeometry ?? 12;
     this.segments = options.segments ?? 32;
     this.maxAnisotropy = options.maxAnisotropy ?? 8;
-    this.fadeDuration = options.fadeDuration ?? 0.3;
+    this.fadeDuration = options.fadeDuration ?? 0.5;
+    this.morphDuration = options.morphDuration ?? 0.4;
+    this.fogScreenSpaceErrorFactor = options.fogScreenSpaceErrorFactor ?? 1;
+    this.preloadSiblings = options.preloadSiblings ?? true;
     this.group.name = 'Globe';
 
     const placeholderTex = new DataTexture(new Uint8Array([28, 46, 72, 255]), 1, 1);
@@ -308,30 +360,51 @@ export class Globe {
     this.applyReady();
 
     this.renderList = [];
+    this.fillList = [];
     for (const q of Object.values(this.queues)) q.length = 0;
-    for (const root of this.roots) this.visit(root);
+    for (const root of this.roots) this.visit(root, false);
 
     // Toggle visibility instead of re-parenting meshes.
     for (const t of this.prevRenderList) if (t.mesh) t.mesh.visible = false;
-    let maxLevel = 0;
-    let waiting = 0;
-    for (const t of this.renderList) {
-      if (t.mesh) t.mesh.visible = true;
-      t.lastRenderedFrame = this.frame;
-      if (!t.ownImagery || t.imageryGen !== this.imageryGen) this.resolveImagery(t);
+    for (const f of this.prevFillList) f.visible = false;
+    for (const f of this.fillList) {
+      f.visible = true;
+      // A fill draws its tile's material: keep that tile's picture current although the tile is not drawn itself.
+      const t = f.userData.globeTile as GlobeTile;
+      if (!t.ownImagery || t.imageryGen !== this.imageryGen) this.resolveImagery(t, false);
       if (this.overlaySource && (t.overlayGen !== this.overlaySource.version || t.overlay !== (t.ownOverlay ?? this.emptyOverlay))) {
         this.resolveOverlay(t);
       }
-      if (this.queueRenderedContent(t)) waiting++;
+    }
+    this.prevFillList = this.fillList;
+    let maxLevel = 0;
+    let waiting = 0;
+    let kept = 0;
+    let held = 0;
+    for (const t of this.renderList) {
+      if (t.mesh) t.mesh.visible = true;
+      // `lastRenderedFrame` still says whether the tile was on screen in the previous frame.
+      if (t.lastRenderedFrame !== this.frame - 1) this.showNewTile(t);
+      else if (this.updateShownImagery(t)) held++;
+      t.lastRenderedFrame = this.frame;
+      if (this.overlaySource && (t.overlayGen !== this.overlaySource.version || t.overlay !== (t.ownOverlay ?? this.emptyOverlay))) {
+        this.resolveOverlay(t);
+      }
+      // Tiles kept only to preserve detail are about to be replaced: do not load for them.
+      if (t.keptForDetail) kept++;
+      else if (this.queueRenderedContent(t)) waiting++;
       maxLevel = Math.max(maxLevel, t.level);
     }
     this.prevRenderList = this.renderList;
 
     this.cancelStaleLoads();
     this.dispatch('geo', this.maxConcurrentGeometry);
-    this.dispatch('img', this.maxConcurrentLoads);
+    // HTTP/1.1 imagery servers take only a few requests at once: dispatch no more than that, so
+    // the rest wait in the priority queue (which is re-sorted every frame) instead of the browser's.
+    this.dispatch('img', Math.min(this.maxConcurrentLoads, this.imagery.maxConcurrentRequests ?? Infinity));
     this.dispatch('ovl', Math.max(4, Math.floor(this.maxConcurrentLoads / 3)));
     this.updateFades();
+    this.updateMorphs();
     if (this.frame % 30 === 0) this.evict();
 
     this.stats.rendered = this.renderList.length;
@@ -341,6 +414,9 @@ export class Globe {
     this.stats.queued = Math.max(0, this.stats.queued);
     this.stats.maxLevel = maxLevel;
     this.stats.waitingImagery = waiting;
+    this.stats.keptForDetail = kept;
+    this.stats.heldImagery = held;
+    this.stats.fills = this.fillList.length;
   }
 
   private prepareCamera(camera: PerspectiveCamera, viewportHeightCss: number): void {
@@ -356,13 +432,24 @@ export class Globe {
     const fov = (camera.getEffectiveFOV() * Math.PI) / 180;
     this.sseFactor = viewportHeightCss / (2 * Math.tan(fov / 2));
     this.halfFovDiagonal = Math.atan(Math.tan(fov / 2) * Math.hypot(1, camera.aspect));
+    // Horizon fog: only for low cameras looking towards the horizon (zero when looking straight down).
+    const up = this.ellipsoid.geodeticNormal(this.cameraPosition, _v);
+    this.fogDensity = this.fogScreenSpaceErrorFactor > 0 ? horizonFogDensity(this.cameraCarto.height, this.cameraForward.dot(up)) : 0;
   }
 
   private get maxLevel(): number {
     return Math.min(MAX_LEVEL, Math.max(this.imagery.maxZoom, this.terrain ? this.terrain.maxZoom : 0));
   }
 
+  /** Frustum and horizon test, cached per frame (a parent tests its children before visiting them). */
   private isVisible(tile: GlobeTile): boolean {
+    if (tile.cullFrame === this.frame) return tile.inView;
+    tile.cullFrame = this.frame;
+    tile.inView = this.testVisible(tile);
+    return tile.inView;
+  }
+
+  private testVisible(tile: GlobeTile): boolean {
     if (!this.frustum.intersectsSphere(tile.boundingSphere)) return false;
     const hp = tile.horizonPoint;
     if (!this.horizonCulling || !hp) return true;
@@ -385,10 +472,12 @@ export class Globe {
     return Math.max(1, _v.set(_p[0], _p[1], _p[2]).distanceTo(this.cameraPosition));
   }
 
+  /** Size of one imagery texel on screen in CSS pixels, relaxed in the horizon fog. */
   private computeSSE(tile: GlobeTile): number {
     const groundSize = (2 * Math.PI * WGS84_A * Math.cos(tile.latForResolution)) / 2 ** tile.level;
     const texel = groundSize / IMAGERY_TILE_SIZE;
-    return (texel * this.sseFactor) / tile.distance;
+    const sse = (texel * this.sseFactor) / tile.distance;
+    return fogRelaxedError(sse, tile.distance, this.fogDensity, this.maxScreenSpaceError, this.fogScreenSpaceErrorFactor);
   }
 
   /** Angle between the view direction and the tile, in units of the half diagonal FOV (0 = view center). */
@@ -405,45 +494,192 @@ export class Globe {
   // ---------------------------------------------------------------------------
   // Selection
 
-  private visit(tile: GlobeTile): void {
+  /**
+   * Selects what to draw under `tile` (CesiumJS `QuadtreePrimitive.visitTile`, adapted).
+   *
+   * @param ancestorMeetsSse An ancestor is detailed enough but cannot be drawn yet without
+   * losing detail: draw what was on screen last frame, refine no further and load nothing.
+   */
+  private visit(tile: GlobeTile, ancestorMeetsSse: boolean): void {
     tile.lastVisitedFrame = this.frame;
-    if (!this.isVisible(tile)) return;
+    if (!this.isVisible(tile)) {
+      this.select(tile, TileSelection.CULLED);
+      return;
+    }
     tile.distance = this.tileDistance(tile);
-    const wantRefine = tile.level < this.maxLevel && this.computeSSE(tile) > this.maxScreenSpaceError;
+    if (!tile.renderable) {
+      // Only roots get here: children are visited once all visible ones can be drawn.
+      this.queue('geo', tile, B_BLOCKING);
+      return;
+    }
+    const canRefine = tile.level < this.maxLevel;
+    const meetsSse = !canRefine || this.computeSSE(tile) <= this.maxScreenSpaceError;
+    const kept = ancestorMeetsSse;
 
-    if (wantRefine && tile.renderable) {
-      const children = tile.createChildren(this.scheme, this.childHeightRange(tile));
-      let ready = true;
-      for (const child of children) {
-        child.lastVisitedFrame = this.frame;
-        if (!this.isVisible(child)) continue;
-        if (!child.renderable) {
-          ready = false;
-          child.distance = this.tileDistance(child);
-          this.queue('geo', child, B_REFINE);
-        }
-      }
-      if (ready) {
-        // Ancestors double as fallbacks for their descendants: keep them current at low priority.
-        if (this.needsImagery(tile)) this.queue('img', tile, B_LOW);
-        // Interim ancestors still need their real terrain: descendants are estimated from it
-        // and culled with its height range.
-        if (this.needsGeometry(tile)) this.queue('geo', tile, B_RENDERED);
-        for (const child of children) this.visit(child);
+    if (meetsSse || ancestorMeetsSse) {
+      if (selectionIn(tile, this.frame - 1) !== TileSelection.REFINED || !this.losesDetail(tile)) {
+        this.render(tile, !kept);
         return;
       }
+      // Drawing this tile would replace sharper descendants that were on screen last frame
+      // with a blurrier picture (zooming out onto a tile whose imagery or terrain is still
+      // loading). Keep them, without refining further, and load this tile first.
+      if (!kept) this.queueBlocker(tile);
+      ancestorMeetsSse = true;
     }
 
-    if (tile.renderable) {
-      this.renderList.push(tile);
-      if (this.needsGeometry(tile)) this.queue('geo', tile, tile.geometryGen === this.geometryGen ? B_RENDERED : B_URGENT);
-    } else {
-      this.queue('geo', tile, B_REFINE);
+    const children = tile.createChildren(this.scheme, this.childHeightRange(tile));
+    let ready = true;
+    let anyReady = false;
+    for (const child of children) {
+      child.lastVisitedFrame = this.frame;
+      if (child.renderable) {
+        anyReady ||= this.isVisible(child);
+        continue;
+      }
+      if (this.isVisible(child)) {
+        ready = false;
+        child.distance = this.tileDistance(child);
+        this.queue('geo', child, B_BLOCKING);
+      } else if (this.preloadSiblings && !kept && this.buildsLocally(child)) {
+        // Just outside the view: an interpolated mesh costs no download and saves a
+        // fallback to this tile (and back) when the child comes into view.
+        child.distance = this.tileDistance(child);
+        this.queue('geo', child, B_LOW);
+      }
     }
+    // A child just came into view without a mesh. If this tile was refined last frame, falling
+    // back to it would swap the sharper children on screen for one frame or more: keep them and
+    // draw this tile's quadrant in place of the missing child (CesiumJS fills) instead.
+    const fill = !ready && anyReady && selectionIn(tile, this.frame - 1) === TileSelection.REFINED;
+    if (!ready && !fill) {
+      // Some visible children cannot be drawn yet; draw this tile meanwhile.
+      this.render(tile, !kept);
+      return;
+    }
+
+    this.select(tile, TileSelection.REFINED);
+    if (!ancestorMeetsSse) {
+      // Ancestors double as fallbacks for their descendants: keep them current at low priority.
+      if (this.needsImagery(tile)) this.queue('img', tile, B_LOW);
+      // Interim ancestors still need their real terrain: descendants are estimated from it
+      // and culled with its height range.
+      if (this.needsGeometry(tile)) this.queue('geo', tile, B_RENDERED);
+    }
+    for (const child of children) {
+      if (child.renderable || !this.isVisible(child)) {
+        this.visit(child, ancestorMeetsSse);
+      } else {
+        this.fillList.push(this.fillFor(tile, child));
+        child.filledFrame = this.frame;
+      }
+    }
+  }
+
+  /** Mesh drawing the quadrant of `tile` that `child` covers (created on first use). */
+  private fillFor(tile: GlobeTile, child: GlobeTile): Mesh {
+    const q = (child.y - tile.y * 2) * 2 + (child.x - tile.x * 2);
+    tile.fills ??= [null, null, null, null];
+    let fill = tile.fills[q];
+    if (fill) return fill;
+    const source = tile.mesh!;
+    const geometry = new BufferGeometry();
+    // Shares the tile's vertex buffers: fills are disposed together with the tile's geometry.
+    for (const name of ['position', 'normal', 'uv', MORPH_ATTRIBUTE]) geometry.setAttribute(name, source.geometry.getAttribute(name));
+    const indices = source.geometry.getIndex()!.array as Uint16Array | Uint32Array;
+    geometry.setIndex(new BufferAttribute(extractQuads(indices, quadrantQuads(tile.segments, q & 1, q >> 1)), 1));
+    geometry.boundingSphere = source.geometry.boundingSphere;
+    fill = new Mesh(geometry, tile.material);
+    fill.name = `fill ${tile.key}/${q}`;
+    fill.frustumCulled = false;
+    fill.matrixAutoUpdate = false;
+    fill.visible = false;
+    fill.position.copy(source.position);
+    fill.updateMatrix();
+    fill.updateMatrixWorld(true);
+    fill.userData.globeTile = tile;
+    this.group.add(fill);
+    tile.fills[q] = fill;
+    return fill;
+  }
+
+  /** Disposes a tile's fills; only together with its geometry, whose vertex buffers they share. */
+  private disposeFills(tile: GlobeTile): void {
+    if (!tile.fills) return;
+    for (const fill of tile.fills) {
+      if (!fill) continue;
+      this.group.remove(fill);
+      fill.geometry.dispose();
+    }
+    tile.fills = null;
+  }
+
+  private select(tile: GlobeTile, result: TileSelection): void {
+    tile.selection = result;
+    tile.selectionFrame = this.frame;
+  }
+
+  /** Adds a tile to this frame's render list; `wanted` = this is the level of detail the view needs. */
+  private render(tile: GlobeTile, wanted: boolean): void {
+    this.select(tile, TileSelection.RENDERED);
+    tile.keptForDetail = !wanted;
+    this.renderList.push(tile);
+    if (wanted && this.needsGeometry(tile)) this.queue('geo', tile, tile.geometryGen === this.geometryGen ? B_RENDERED : B_URGENT);
+  }
+
+  /**
+   * Whether drawing `tile` now would make detail vanish that its descendants
+   * showed last frame (CesiumJS `canRenderWithoutLosingDetail`, negated):
+   * its own imagery is still loading and a descendant showed sharper imagery
+   * than the tile can (a magnified ancestor), or its terrain is still interim
+   * and a descendant had real terrain. Failed loads count as done.
+   */
+  private losesDetail(tile: GlobeTile): boolean {
+    const imageryDone = !this.needsImagery(tile) || tile.img.failures > 0;
+    const terrainDone = !this.terrain || this.hasExactTerrain(tile) || tile.geo.failures > 0;
+    if (imageryDone && terrainDone) return false;
+    const fallback = this.fallbackLevel(tile);
+    const shown = fallback === -Infinity ? -1 : fallback;
+    return wouldLoseDetail(
+      tile,
+      this.frame - 1,
+      (d) => (!imageryDone && (d.imagery?.level ?? -1) > shown) || (!terrainDone && this.hasExactTerrain(d)),
+    );
+  }
+
+  /** Loads what `tile` lacks to replace its descendants (they stay on screen meanwhile). */
+  private queueBlocker(tile: GlobeTile): void {
+    if (this.needsImagery(tile) && tile.img.failures === 0) this.queue('img', tile, B_BLOCKING);
+    if (this.terrain && !this.hasExactTerrain(tile) && tile.geo.failures === 0) this.queue('geo', tile, B_BLOCKING);
   }
 
   private needsGeometry(tile: GlobeTile): boolean {
     return !tile.mesh || tile.geometryGen !== this.geometryGen || tile.upsampled;
+  }
+
+  /** Mesh built from this tile's own terrain for the current source (not interpolated or flat). */
+  private hasExactTerrain(tile: GlobeTile): boolean {
+    return tile.mesh !== null && !tile.upsampled && tile.geometryGen === this.geometryGen && tile.dataLevel >= 0;
+  }
+
+  /**
+   * Where the next mesh for `tile` comes from without a download: an ancestor
+   * with real terrain at most `MAX_UPSAMPLE_LEVELS` up (interpolated), 'flat'
+   * for a root that has nothing yet, or null when it needs terrain data
+   * (also when the tile already shows an interim mesh: next is the exact one).
+   */
+  private interimSource(tile: GlobeTile): GlobeTile | 'flat' | null {
+    if (!this.terrain) return null;
+    if (tile.mesh !== null && tile.geometryGen === this.geometryGen && tile.upsampled) return null;
+    // Interpolate from real terrain only (never from another estimate), and not from too far up.
+    const src = this.exactAncestor(tile.parent);
+    if (src && tile.level - src.level <= MAX_UPSAMPLE_LEVELS) return src;
+    return !tile.parent && !tile.mesh ? 'flat' : null;
+  }
+
+  /** Whether the next mesh for `tile` needs no download (flat globe, or interpolated from loaded terrain). */
+  private buildsLocally(tile: GlobeTile): boolean {
+    return !this.terrain || this.interimSource(tile) !== null;
   }
 
   /** Closest ancestor-or-self with real (not interpolated) terrain for the current source. */
@@ -535,8 +771,15 @@ export class Globe {
   private queue(kind: ChannelKind, tile: GlobeTile, bucket: number): void {
     const ch = channelOf(tile, kind);
     // Buckets dominate; anchors load coarse-to-fine; then by distance from the view center.
+    // Imagery of drawn tiles is ordered by their parent's block, so the four siblings load back
+    // to back and can be revealed together (`imagerySwitchDue`); center-first still holds per block.
+    const block = kind === 'img' && (bucket === B_RENDERED || bucket === B_URGENT) && tile.parent ? tile.parent : tile;
     const priority =
-      bucket * 1e8 + (bucket === B_ANCHOR ? tile.level * 1e6 : 0) + Math.min(this.foveation(tile), 9.99) * 1e4 + Math.min(Math.log2(1 + tile.distance), 99) * 10;
+      bucket * 1e8 +
+      (bucket === B_ANCHOR ? tile.level * 1e6 : 0) +
+      Math.min(this.foveation(block), 9.99) * 1e4 +
+      Math.min(Math.log2(1 + block.distance), 99) * 10 +
+      (block !== tile ? Math.min(this.foveation(tile), 9.99) * 0.1 : 0);
     if (ch.wantedFrame === this.frame) {
       if (priority < ch.priority) {
         ch.priority = priority;
@@ -553,25 +796,43 @@ export class Globe {
   // ---------------------------------------------------------------------------
   // Loading
 
+  /**
+   * Starts queued loads in priority order within the channel's concurrency
+   * limit (`B_LOW` gets at most a third of it). Geometry that needs no
+   * download (interpolated or flat meshes, about a millisecond in a worker)
+   * has its own budget so it never waits behind slow terrain requests.
+   */
   private dispatch(kind: ChannelKind, limit: number): void {
     const queue = this.queues[kind];
     if (queue.length === 0) return;
-    const active = this.active[kind];
-    if (active.size >= limit) return;
+    // Pool 0: downloads (limit); pool 1: geometry built from loaded data.
+    const limits = [limit, kind === 'geo' ? LOCAL_GEOMETRY_LIMIT : 0];
+    const active = [0, 0];
+    const low = [0, 0];
+    for (const t of this.active[kind]) {
+      const ch = channelOf(t, kind);
+      const pool = kind === 'geo' && ch.local ? 1 : 0;
+      active[pool]++;
+      if (ch.bucket >= B_LOW) low[pool]++;
+    }
+    const full = () => active[0] >= limits[0] && active[1] >= limits[1];
+    if (full()) return;
     queue.sort((a, b) => channelOf(a, kind).priority - channelOf(b, kind).priority);
-    let lowActive = 0;
-    for (const t of active) if (channelOf(t, kind).bucket >= B_LOW) lowActive++;
-    const lowLimit = Math.max(1, Math.floor(limit / 3));
     for (const tile of queue) {
-      if (active.size >= limit) break;
+      if (full()) break;
       const ch = channelOf(tile, kind);
       if (ch.loading || this.now < ch.retryAt) continue;
+      const pool = kind === 'geo' && this.buildsLocally(tile) ? 1 : 0;
+      if (active[pool] >= limits[pool]) continue;
       if (ch.bucket >= B_LOW) {
-        if (lowActive >= lowLimit) continue;
-        lowActive++;
+        if (low[pool] >= Math.max(1, Math.floor(limits[pool] / 3))) continue;
+        low[pool]++;
       }
-      if (kind === 'geo') this.startGeometry(tile);
-      else if (kind === 'img') this.startImagery(tile);
+      active[pool]++;
+      if (kind === 'geo') {
+        ch.local = pool === 1;
+        this.startGeometry(tile);
+      } else if (kind === 'img') this.startImagery(tile);
       else this.startOverlay(tile);
     }
   }
@@ -616,7 +877,11 @@ export class Globe {
       if (applied >= APPLY_BUDGET || performance.now() - start > APPLY_BUDGET_MS) break;
       const item = this.ready[i];
       this.finish(item.kind, item.tile, item.controller);
-      if (item.controller.signal.aborted || item.epoch !== item.tile.epoch) {
+      // Imagery that arrived although no longer wanted is still this tile's picture (providers on
+      // HTTP/1.1 let started downloads finish rather than close the connection): keep it cached.
+      // Its apply step drops results of a replaced provider.
+      const keepLate = item.kind === 'img';
+      if ((item.controller.signal.aborted && !keepLate) || item.epoch !== item.tile.epoch) {
         item.discard();
         continue;
       }
@@ -633,22 +898,17 @@ export class Globe {
     const terrain = this.terrain;
     if (terrain) this.workers.registerTerrain(terrain);
 
-    // Refinement should not wait on the network: build an interim mesh from the
-    // parent's heights while the exact terrain downloads in the worker.
+    // Refinement should not wait on the network: build an interim mesh from an
+    // ancestor's heights while the exact terrain downloads in the worker.
     let upsample: UpsampleSource | null = null;
-    const replacingInterim = tile.mesh !== null && tile.geometryGen === gen && tile.upsampled;
-    const parent = tile.parent;
-    if (terrain && !replacingInterim) {
-      // Interpolate from real terrain only (never from another estimate), and not from too far up.
-      const src = this.exactAncestor(parent);
-      if (src && tile.level - src.level <= MAX_UPSAMPLE_LEVELS) {
-        upsample = { heights: src.heights!.slice(), segments: src.segments, level: src.level, x: src.x, y: src.y };
-      } else if (!parent && !tile.mesh) {
-        // Roots start flat (relief is invisible from orbit) so the globe shows up at once
-        // instead of after the first, possibly slow, terrain download.
-        const n = this.segments + 1;
-        upsample = { heights: new Float32Array(n * n), segments: this.segments, level: tile.level, x: tile.x, y: tile.y };
-      }
+    const src = this.interimSource(tile);
+    if (src === 'flat') {
+      // Roots start flat (relief is invisible from orbit) so the globe shows up at once
+      // instead of after the first, possibly slow, terrain download.
+      const n = this.segments + 1;
+      upsample = { heights: new Float32Array(n * n), segments: this.segments, level: tile.level, x: tile.x, y: tile.y };
+    } else if (src) {
+      upsample = { heights: src.heights!.slice(), segments: src.segments, level: src.level, x: src.x, y: src.y };
     }
 
     this.workers
@@ -662,6 +922,8 @@ export class Globe {
           exaggeration: this.exaggeration,
           clampToSeaLevel: true,
           upsample,
+          // Meshes built ahead of need (siblings outside the view) do not download terrain yet.
+          prefetch: tile.geo.bucket < B_LOW,
         },
         controller.signal,
         terrain ? terrainAffinity(terrain, tile.level, tile.x, tile.y, this.segments) : undefined,
@@ -824,25 +1086,184 @@ export class Globe {
     tile.ownImagery?.release();
     tile.ownImagery = texture ? texture.acquire() : null;
     tile.imageryGen = gen;
-    this.resolveImagery(tile);
+    // Applied before this frame's traversal. On screen: the render loop reveals it (with its
+    // siblings, cross-faded). Off screen: show it directly.
+    if (tile.lastRenderedFrame !== this.frame - 1) this.resolveImagery(tile, false);
     this.trackLoaded(tile);
   }
 
   /**
-   * Picks this tile's own imagery or the closest ancestor's (magnified). When
-   * the picture changes on a tile that is on screen, the old one cross-fades out.
+   * A tile that was not on screen last frame takes over from its parent (zooming
+   * in) or its descendants (zooming out). It starts with the best imagery at
+   * once: fading in from whatever it showed when it was last drawn would flash
+   * an outdated, often much coarser picture. When it replaces its parent with
+   * sharper imagery (e.g. cached from an earlier visit), it fades in from the
+   * parent's picture so refinement does not pop.
    */
-  private resolveImagery(tile: GlobeTile): void {
+  private showNewTile(tile: GlobeTile): void {
+    if (tile.fadeFrom) this.endFade(tile);
+    this.resolveImagery(tile, false);
+    const before = this.shownAncestor(tile);
+    this.morphFromPrevious(tile, before);
+    const from = before?.imagery;
+    if (!before || !from || from === tile.imagery || this.fadeDuration <= 0) return;
+    // The part of the ancestor's picture that covered this tile.
+    const p = before.material.imageryTransform;
+    let t: [number, number, number, number] = [p.x, p.y, p.z, p.w];
+    for (let dz = tile.level - before.level - 1; dz >= 0; dz--) {
+      t = childUvTransform(t, (tile.x >> dz) & 1, (tile.y >> dz) & 1);
+    }
+    this.startFade(tile, from.acquire(), _prevTransform.set(t[0], t[1], t[2], t[3]));
+  }
+
+  /**
+   * The ancestor whose picture covered `tile` last frame: one drawn itself
+   * (zooming in, possibly several levels at once), or the parent through the
+   * fill that stood in for `tile`. Null when `tile` replaces descendants.
+   */
+  private shownAncestor(tile: GlobeTile): GlobeTile | null {
+    const last = this.frame - 1;
+    if (tile.filledFrame === last) return tile.parent;
+    for (let a = tile.parent; a; a = a.parent) {
+      if (a.lastRenderedFrame === last) return a;
+    }
+    return null;
+  }
+
+  /**
+   * Height drawn last frame at (u, v) of `tile` (u east, v south, 0..1) by the
+   * descendants that `tile` now replaces (zooming out), or null.
+   */
+  private shownHeightBelow(tile: GlobeTile, u: number, v: number): number | null {
+    const last = this.frame - 1;
+    let t = tile;
+    while (t.children) {
+      const cx = u < 0.5 ? 0 : 1;
+      const cy = v < 0.5 ? 0 : 1;
+      const c = t.children[cy * 2 + cx];
+      const cu = Math.min(1, u * 2 - cx);
+      const cv = Math.min(1, v * 2 - cy);
+      if (c.lastRenderedFrame === last) return c.heights && c.geometryGen === this.geometryGen ? c.sampleHeight(cu, cv) : null;
+      // `t`'s quadrant stood in for `c`.
+      if (c.filledFrame === last) return t.heights && t.geometryGen === this.geometryGen ? t.sampleHeight(u, v) : null;
+      t = c;
+      u = cu;
+      v = cv;
+    }
+    return null;
+  }
+
+  /**
+   * Starts morphing a tile that has just come on screen from the surface drawn
+   * there last frame: `before` (an ancestor, zooming in) or the descendants
+   * it replaces (zooming out). Interim children of the drawn ancestor share its
+   * surface, so the common zoom-in case needs no morph.
+   */
+  private morphFromPrevious(tile: GlobeTile, before: GlobeTile | null): void {
+    if (!this.terrain || this.morphDuration <= 0 || !tile.heights || tile.geometryGen !== this.geometryGen) return;
+    const N = tile.segments;
+    if (before) {
+      if (!before.heights || before.geometryGen !== this.geometryGen) return;
+      const scale = 2 ** (tile.level - before.level);
+      const ou = tile.x - before.x * scale;
+      const ov = tile.y - before.y * scale;
+      this.startMorph(tile, (i, j) => before.sampleHeight((ou + i / N) / scale, (ov + j / N) / scale));
+    } else if (tile.children) {
+      this.startMorph(tile, (i, j) => this.shownHeightBelow(tile, i / N, j / N));
+    }
+  }
+
+  /** Morphs `tile`'s mesh from `oldHeight` (per grid vertex) to its own heights; tiny changes snap. */
+  private startMorph(tile: GlobeTile, oldHeight: (i: number, j: number) => number | null): void {
+    const attr = tile.morphAttribute;
+    if (!attr || !tile.heights) return;
+    const { max } = morphDeltas(tile.segments, tile.heights, oldHeight, attr.array as Float32Array);
+    // Below half a meter nobody sees the change (the offsets are ignored at morph = 1).
+    if (max < 0.5) {
+      this.endMorph(tile);
+      return;
+    }
+    attr.needsUpdate = true;
+    tile.morphStart = this.now;
+    tile.material.morph = 0;
+    this.morphing.add(tile);
+  }
+
+  private endMorph(tile: GlobeTile): void {
+    this.morphing.delete(tile);
+    tile.material.morph = 1;
+  }
+
+  private updateMorphs(): void {
+    if (this.morphing.size === 0) return;
+    const duration = Math.max(1e-3, this.morphDuration * 1000);
+    for (const tile of this.morphing) {
+      const k = (this.now - tile.morphStart) / duration;
+      if (k >= 1 || !tile.mesh) this.endMorph(tile);
+      else tile.material.morph = k * k * (3 - 2 * k);
+    }
+  }
+
+  /**
+   * Picks this tile's own imagery or the closest ancestor's (magnified). With
+   * `fade` (the tile was on screen last frame), a change of picture
+   * cross-fades from the old one.
+   */
+  private resolveImagery(tile: GlobeTile, fade: boolean): void {
+    this.showImagery(tile, this.imagerySource(tile), fade);
+  }
+
+  /** The tile with the best imagery for `tile`: itself, the closest ancestor with imagery, or (provider just changed) a stale one. */
+  private imagerySource(tile: GlobeTile): GlobeTile | null {
     let src: GlobeTile | null = tile;
     let stale: GlobeTile | null = null;
     while (src) {
       if (src.ownImagery) {
-        if (src.imageryGen === this.imageryGen) break;
+        if (src.imageryGen === this.imageryGen) return src;
         stale ??= src;
       }
       src = src.parent;
     }
-    src ??= stale;
+    return stale;
+  }
+
+  /**
+   * Imagery update for a tile that stays on screen. Better imagery is not
+   * shown the moment it arrives (`imagerySwitchDue`): sharper ancestors are
+   * coalesced and a tile's own imagery waits for its siblings', so the view
+   * sharpens in a few calm cross-fades instead of flickering tile by tile.
+   * Returns whether better imagery is being held back.
+   */
+  private updateShownImagery(tile: GlobeTile): boolean {
+    const src = this.imagerySource(tile);
+    const target = src?.ownImagery ?? this.placeholder;
+    if (target === tile.imagery) {
+      tile.imageryPendingSince = 0;
+      return false;
+    }
+    if (tile.imageryPendingSince === 0) tile.imageryPendingSince = this.now;
+    const own = src === tile;
+    const fromPlaceholder = !tile.imagery || tile.imagery === this.placeholder;
+    const due = imagerySwitchDue(this.now - tile.imageryPendingSince, own, fromPlaceholder, own && this.siblingsHaveImagery(tile));
+    if (!due) return true;
+    this.showImagery(tile, src, true);
+    tile.imageryPendingSince = 0;
+    return false;
+  }
+
+  /** Whether every sibling drawn this frame has its own imagery, or has none to wait for (out of range, missing, failed). */
+  private siblingsHaveImagery(tile: GlobeTile): boolean {
+    const siblings = tile.parent?.children;
+    if (!siblings) return true;
+    for (const s of siblings) {
+      if (s === tile || selectionIn(s, this.frame) !== TileSelection.RENDERED) continue;
+      if (s.imageryGen === this.imageryGen || s.img.failures > 0) continue;
+      return false;
+    }
+    return true;
+  }
+
+  private showImagery(tile: GlobeTile, src: GlobeTile | null, fade: boolean): void {
     const shared = src?.ownImagery ?? this.placeholder;
     const material = tile.material;
     if (tile.imagery !== shared) {
@@ -851,8 +1272,7 @@ export class Globe {
       tile.imagery = shared;
       _prevTransform.copy(material.imageryTransform);
       this.setImageryTransform(tile, src);
-      const onScreen = tile.mesh?.visible === true && tile.lastRenderedFrame >= this.frame - 1;
-      if (previous && onScreen && this.fadeDuration > 0) {
+      if (previous && fade && tile.mesh && this.fadeDuration > 0) {
         this.startFade(tile, previous, _prevTransform);
       } else {
         previous?.release();
@@ -879,8 +1299,19 @@ export class Globe {
     }
   }
 
-  /** Starts cross-fading from `from` (ownership of one reference passes to the tile). */
+  /**
+   * Starts cross-fading from `from` (ownership of one reference passes to the
+   * tile). When a fade is still running, the picture on screen is a blend of
+   * its source and `from` (its target). Restarting from `from` would pop the
+   * part of the source still visible, e.g. an anchor tile and the tile's own
+   * imagery arriving right after each other. While the source still dominates,
+   * the fade keeps it and just retargets to the new imagery.
+   */
   private startFade(tile: GlobeTile, from: SharedTexture, fromTransform: Vector4): void {
+    if (tile.fadeFrom && tile.material.fade < 0.5) {
+      from.release();
+      return;
+    }
     tile.fadeFrom?.release();
     tile.fadeFrom = from;
     tile.fadeStart = this.now;
@@ -917,10 +1348,23 @@ export class Globe {
     geometry.setAttribute('normal', new BufferAttribute(built.normals, 3));
     geometry.setAttribute('uv', new BufferAttribute(built.uvs, 2));
     geometry.setIndex(new BufferAttribute(built.indices, 1));
+    // Own buffer per geometry: disposing a geometry frees every attribute it was drawn with.
+    geometry.setAttribute(MORPH_ATTRIBUTE, new BufferAttribute(new Float32Array(tileVertexCount(this.segments)), 1));
     geometry.computeBoundingSphere();
 
     let mesh = tile.mesh;
+    // Replacing a mesh that is on screen (applied before this frame's traversal, so "last frame"
+    // is still the current picture): remember the surface it shows, to morph from it.
+    const N = this.segments;
+    let shown: Float32Array | null = null;
+    const onScreen = tile.lastRenderedFrame === this.frame - 1 || (tile.fills?.some((f) => f?.visible) ?? false);
+    if (mesh && onScreen && this.terrain && this.morphDuration > 0 && tile.heights && tile.segments === N && built.heights) {
+      shown = new Float32Array((N + 1) * (N + 1));
+      for (let j = 0; j <= N; j++) for (let i = 0; i <= N; i++) shown[j * (N + 1) + i] = tile.shownGridHeight(i, j) ?? NaN;
+    }
     if (mesh) {
+      // Fills share the old vertex buffers: rebuilt from the new geometry on demand.
+      this.disposeFills(tile);
       mesh.geometry.dispose();
       mesh.geometry = geometry;
     } else {
@@ -934,7 +1378,7 @@ export class Globe {
       tile.mesh = mesh;
       this.group.add(mesh);
       // Show the best available imagery from the first frame on.
-      this.resolveImagery(tile);
+      this.resolveImagery(tile, false);
       this.resolveOverlay(tile);
     }
     mesh.position.set(built.center[0], built.center[1], built.center[2]);
@@ -950,6 +1394,12 @@ export class Globe {
     tile.boundingSphere.center.set(built.center[0], built.center[1], built.center[2]);
     tile.boundingSphere.radius = built.boundingRadius;
     tile.horizonPoint = built.horizonPoint ? new Vector3(...built.horizonPoint) : null;
+    if (shown) {
+      const old = shown;
+      this.startMorph(tile, (i, j) => old[j * (N + 1) + i]);
+    } else {
+      this.endMorph(tile);
+    }
     if (tile.children) {
       const [lo, hi] = this.childHeightRange(tile);
       for (const c of tile.children) {
@@ -994,6 +1444,8 @@ export class Globe {
     tile.abortAll();
     tile.epoch++;
     if (this.fading.has(tile)) this.endFade(tile);
+    this.endMorph(tile);
+    this.disposeFills(tile);
     if (tile.mesh) {
       tile.mesh.geometry.dispose();
       this.group.remove(tile.mesh);
@@ -1013,6 +1465,7 @@ export class Globe {
     tile.upsampled = false;
     tile.geometryGen = -1;
     tile.imageryGen = -1;
+    tile.imageryPendingSince = 0;
     if (tile.children) {
       // Children carry no content at this point (leaf-first eviction); drop the nodes.
       for (const c of tile.children) {
@@ -1087,12 +1540,11 @@ export class Globe {
   raycast(ray: Ray): { point: Vector3; distance: number } | null {
     let bestDist = Infinity;
     const best = new Vector3();
-    for (const tile of this.renderList) {
-      const mesh = tile.mesh;
-      if (!mesh || !ray.intersectsSphere(tile.boundingSphere)) continue;
+    // Grid triangles come first in both tile meshes and fills (tileMeshLayout.ts); skirts are skipped.
+    const test = (mesh: Mesh, sphere: Sphere, triCount: number) => {
+      if (!ray.intersectsSphere(sphere)) return;
       const pos = mesh.geometry.getAttribute('position') as BufferAttribute;
       const index = mesh.geometry.getIndex()!;
-      const triCount = tile.segments * tile.segments * 2;
       _localRay.origin.subVectors(ray.origin, mesh.position);
       _localRay.direction.copy(ray.direction);
       for (let t = 0; t < triCount; t++) {
@@ -1107,6 +1559,11 @@ export class Globe {
           }
         }
       }
+    };
+    for (const tile of this.renderList) if (tile.mesh) test(tile.mesh, tile.boundingSphere, tile.segments * tile.segments * 2);
+    for (const fill of this.fillList) {
+      const tile = fill.userData.globeTile as GlobeTile;
+      test(fill, tile.boundingSphere, (tile.segments / 2) ** 2 * 2);
     }
     if (bestDist < Infinity) return { point: best, distance: bestDist };
     const t = this.ellipsoid.intersectRay(ray);
@@ -1166,6 +1623,8 @@ export class Globe {
       geometry.setAttribute('position', new BufferAttribute(new Float32Array(positions), 3));
       geometry.setAttribute('normal', new BufferAttribute(new Float32Array(normals), 3));
       geometry.setAttribute('uv', new BufferAttribute(new Float32Array((positions.length / 3) * 2).fill(0.5), 2));
+      // Same attributes as tile meshes, so caps share their pipeline (never morphed).
+      geometry.setAttribute(MORPH_ATTRIBUTE, new BufferAttribute(new Float32Array(positions.length / 3), 1));
       geometry.setIndex(indices);
       geometry.computeBoundingSphere();
       const mesh = new Mesh(geometry, createTileMaterial(tex, 0));

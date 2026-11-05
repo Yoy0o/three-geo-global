@@ -1,6 +1,7 @@
 import { DataTexture, SRGBColorSpace, Texture, Vector4 } from 'three';
 import { MeshBasicNodeMaterial } from 'three/webgpu';
 import {
+  attribute,
   dot,
   float,
   Fn,
@@ -46,7 +47,19 @@ export interface TileMaterial extends MeshBasicNodeMaterial {
   overlayMap: Texture;
   overlayTransform: Vector4;
   tileLevel: number;
+  /**
+   * Geometry morph, 0..1: each vertex is drawn `(1 - morph) * morphDelta`
+   * meters below its height along the ellipsoid normal, so a new mesh can
+   * start out as the surface that was on screen before. 1 = the mesh as built.
+   */
+  morph: number;
 }
+
+/** Per-vertex attribute holding the morph offsets (meters); every tile geometry must have it. */
+export const MORPH_ATTRIBUTE = 'morphDelta';
+
+/** a² / b² of WGS84: scales ECEF z so the gradient of the ellipsoid gives the geodetic normal. */
+const WGS84_A2_OVER_B2 = 1.006739496742276;
 
 /** 1x1 fully transparent texture used when a tile has no overlay. */
 export const EMPTY_OVERLAY = new DataTexture(new Uint8Array([0, 0, 0, 0]), 1, 1);
@@ -99,21 +112,29 @@ function sharedNodes(): SharedNodes {
 
   const imageryTransform: TSLNode = materialReference('imageryTransform', 'vec4');
   const tileLevel: TSLNode = materialReference('tileLevel', 'float');
+  const morph: TSLNode = materialReference('morph', 'float');
+  const morphDelta: TSLNode = attribute(MORPH_ATTRIBUTE, 'float');
 
   const vInscatter = varyingProperty('vec3', 'vInscatter');
   const vTransmittance = varyingProperty('vec3', 'vTransmittance');
   const vSunTransmittance = varyingProperty('vec3', 'vSunTransmittance');
   const vSunMu = varyingProperty('float', 'vSunMu');
 
-  // Vertex stage: per-vertex aerial perspective (cheap and smooth enough at tile resolution).
+  // Vertex stage: geometry morph, then per-vertex aerial perspective (cheap and smooth enough at tile resolution).
   const positionNode = Fn(() => {
+    // Meshes are translated only (RTC), so the ECEF normal is also the local one. float32 ECEF is
+    // plenty for a direction; offsets are tens to hundreds of meters.
+    const ecef = modelWorldMatrix.mul(vec4(positionGeometry, 1)).xyz;
+    const up = normalize(ecef.mul(vec3(1, 1, WGS84_A2_OVER_B2)));
+    const position = positionGeometry.sub(up.mul(morphDelta.mul(float(1).sub(morph)))).toVar();
+
     vInscatter.assign(vec3(0));
     vTransmittance.assign(vec3(1));
     vSunTransmittance.assign(vec3(1));
     vSunMu.assign(1);
 
     If(U.atmosphereEnabled.greaterThan(0.5).or(U.lightingEnabled.greaterThan(0.5)), () => {
-      const worldPos = modelWorldMatrix.mul(vec4(positionGeometry, 1)).xyz;
+      const worldPos = modelWorldMatrix.mul(vec4(position, 1)).xyz;
       const pKm = toAtmosphereSpace(worldPos);
       const camKm = U.cameraPositionKm;
       const toVertex = pKm.sub(camKm);
@@ -131,7 +152,7 @@ function sharedNodes(): SharedNodes {
       vSunMu.assign(sun.mu);
     });
 
-    return positionGeometry;
+    return position;
   })();
 
   const imageryUV = uv().mul(imageryTransform.zw).add(imageryTransform.xy);
@@ -192,6 +213,7 @@ export function createTileMaterial(texture: Texture = placeholder, level = 0): T
   material.overlayMap = EMPTY_OVERLAY;
   material.overlayTransform = new Vector4(0, 0, 1, 1);
   material.tileLevel = level;
+  material.morph = 1;
   const nodes = sharedNodes();
   material.positionNode = nodes.positionNode;
   material.colorNode = nodes.colorNode;

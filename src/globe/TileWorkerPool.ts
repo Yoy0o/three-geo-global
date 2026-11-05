@@ -76,7 +76,15 @@ export class TileWorkerPool {
       signal?.addEventListener(
         'abort',
         () => {
-          if (this.jobs.has(id)) this.workers[index].postMessage({ type: 'cancel', id });
+          const job = this.jobs.get(id);
+          if (!job) return;
+          // Settle now so the caller's load slot frees up at once; the worker drops the job
+          // (and its download, unless another job waits for the same data) and its late
+          // reply is ignored.
+          this.jobs.delete(id);
+          this.load[index]--;
+          this.workers[index].postMessage({ type: 'cancel', id });
+          job.reject(abortError());
         },
         { once: true },
       );

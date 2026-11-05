@@ -1,8 +1,13 @@
-import { Mesh, Sphere, Texture, Vector3 } from 'three';
+/**
+ * One node of the globe quadtree: culling volume, content (mesh, imagery,
+ * overlay) and per-channel load state. Scheduling lives in `Globe`.
+ */
+import { type BufferAttribute, Mesh, Sphere, Texture, Vector3 } from 'three';
 import { computeHorizonCullingPoint, geodeticToEcef } from '../core/geodesy';
 import { sampleHeightGrid } from './terrain/terrainTiling';
 import type { GeoRect, WebMercatorTilingScheme } from './TilingScheme';
-import { createTileMaterial, type TileMaterial } from './TileMaterial';
+import { createTileMaterial, MORPH_ATTRIBUTE, type TileMaterial } from './TileMaterial';
+import { TileSelection, type SelectionNode } from './tileSelection';
 
 /** Reference-counted texture shared between a tile and descendants that magnify it. */
 export class SharedTexture {
@@ -40,6 +45,8 @@ export class LoadChannel {
   bucket = 0;
   /** Last frame the content was wanted; in-flight loads not wanted for a while are cancelled. */
   wantedFrame = -1;
+  /** In-flight geometry is built from loaded heights (no download); such jobs have their own concurrency budget. */
+  local = false;
 
   fail(now: number): void {
     this.failures++;
@@ -56,10 +63,26 @@ const _pts = new Float64Array(5 * 5 * 2 * 3);
 const _p = [0, 0, 0];
 const _v = new Vector3();
 
-export class GlobeTile {
+export class GlobeTile implements SelectionNode<GlobeTile> {
   readonly key: string;
   readonly rect: GeoRect;
   children: GlobeTile[] | null = null;
+
+  // Selection memory (CesiumJS `TileSelectionResult`): what the last traversal that visited this tile did with it.
+  selection: TileSelection = TileSelection.NONE;
+  selectionFrame = -1;
+  /**
+   * Drawn only so that detail on screen does not vanish while an ancestor
+   * that should replace it is still loading; such tiles load nothing.
+   */
+  keptForDetail = false;
+  /** Last frame the parent's quadrant was drawn in place of this tile (a fill, see `fills`). */
+  filledFrame = -1;
+  /** Start (ms) of the running geometry morph (`material.morph` < 1). */
+  morphStart = 0;
+  /** Frame of the cached visibility test (`inView`). */
+  cullFrame = -1;
+  inView = false;
 
   // Culling volume (ECEF). Estimated until geometry arrives.
   minHeight: number;
@@ -71,6 +94,12 @@ export class GlobeTile {
 
   // Content.
   mesh: Mesh | null = null;
+  /**
+   * Quadrants of `mesh` (index = qy * 2 + qx), created on demand: drawn in
+   * place of a child that has no mesh yet so this tile can stay refined
+   * (CesiumJS "fill" tiles). They share the mesh's vertex buffers and material.
+   */
+  fills: (Mesh | null)[] | null = null;
   heights: Float32Array | null = null;
   segments = 0;
   geometryGen = -1;
@@ -86,6 +115,8 @@ export class GlobeTile {
   /** Previous imagery while cross-fading to `imagery`. */
   fadeFrom: SharedTexture | null = null;
   fadeStart = 0;
+  /** Since when (ms) better imagery has been available but held back (0 = none; see `Globe.updateShownImagery`). */
+  imageryPendingSince = 0;
   /** Overlay (e.g. rasterized vectors) produced for this exact tile. */
   ownOverlay: SharedTexture | null = null;
   /** Overlay used for rendering: own, a magnified ancestor's, or the empty texture. */
@@ -189,6 +220,23 @@ export class GlobeTile {
       ];
     }
     return this.children;
+  }
+
+  /** Morph offsets of the current mesh (see `TileMaterial.morph`). */
+  get morphAttribute(): BufferAttribute | null {
+    return (this.mesh?.geometry.getAttribute(MORPH_ATTRIBUTE) as BufferAttribute | undefined) ?? null;
+  }
+
+  /**
+   * Height the mesh is drawn at right now for grid vertex (i, j): its own
+   * height, minus what is left of a running morph.
+   */
+  shownGridHeight(i: number, j: number): number | null {
+    if (!this.heights) return null;
+    const k = j * (this.segments + 1) + i;
+    const m = this.material.morph;
+    const delta = m < 1 ? (this.morphAttribute?.getX(k) ?? 0) : 0;
+    return this.heights[k] - delta * (1 - m);
   }
 
   /** Bilinear height sample at normalized tile coordinates (u east, v south). */

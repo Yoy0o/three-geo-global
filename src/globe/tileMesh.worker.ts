@@ -7,6 +7,10 @@
  * 256 px tile serves 8 x 8 mesh tiles at full resolution). Requests carrying
  * an `upsample` grid are answered at once from the ancestor's heights while
  * the exact terrain tile is prefetched for the follow-up request.
+ *
+ * Downloads are shared by every job that needs the same terrain tile and are
+ * aborted when the last waiting job is cancelled, so requests the view no
+ * longer needs do not hold the server's connections.
  */
 import { computeHorizonCullingPoint, geodeticNormal, geodeticToEcef, mercatorVToLatitude, WGS84_A } from '../core/geodesy';
 import { geoidUndulation } from '../core/Geoid';
@@ -14,6 +18,7 @@ import type { BuildTileRequest, BuiltTile, WorkerRequest, WorkerResponse } from 
 import { isQuantizedMesh, type QuantizedMeshTerrainSource, type RasterTerrainSource, type TerrainSource } from './terrain/TerrainSource';
 import { decodeQuantizedMesh, geographicTileRect, isTileAvailable, rasterizeQuantizedMesh, sampleGrid } from './terrain/quantizedMesh';
 import { rasterSourceTile, terrainLevelOffset, upsampleHeightGrid } from './terrain/terrainTiling';
+import { buildTileIndices, edgeVertices } from './tileMeshLayout';
 
 // Minimal worker scope typing (the project compiles against the DOM lib).
 declare const self: {
@@ -27,18 +32,93 @@ interface HeightImage {
   data: Float32Array;
 }
 
+/** A download shared by the jobs that need it (and kept as a small LRU cache once done). */
+interface SharedLoad<T> {
+  promise: Promise<T>;
+  controller: AbortController;
+  /** Jobs currently waiting for it; prefetches do not count. */
+  waiters: number;
+  settled: boolean;
+}
+
 const HEIGHT_CACHE_SIZE = 64;
-const heightCache = new Map<string, Promise<HeightImage>>();
-const pending = new Set<number>();
-const cancelled = new Set<number>();
+const heightCache = new Map<string, SharedLoad<HeightImage>>();
+/** In-flight build jobs by request id. */
+const jobs = new Map<number, AbortController>();
 const sources = new Map<string, TerrainSource>();
+
+function abortError(): Error {
+  return new DOMException('Aborted', 'AbortError');
+}
+
+/** The cached load for `key` (refreshing its LRU position), or a new one. */
+function sharedLoad<T>(cache: Map<string, SharedLoad<T>>, key: string, start: (signal: AbortSignal) => Promise<T>): SharedLoad<T> {
+  const cached = cache.get(key);
+  if (cached) {
+    cache.delete(key);
+    cache.set(key, cached);
+    return cached;
+  }
+  const controller = new AbortController();
+  const entry: SharedLoad<T> = { promise: start(controller.signal), controller, waiters: 0, settled: false };
+  entry.promise.then(
+    () => {
+      entry.settled = true;
+    },
+    () => {
+      entry.settled = true;
+      if (cache.get(key) === entry) cache.delete(key);
+    },
+  );
+  cache.set(key, entry);
+  while (cache.size > HEIGHT_CACHE_SIZE) cache.delete(cache.keys().next().value as string);
+  return entry;
+}
+
+/**
+ * Waits for a shared load on behalf of a job. If the job is cancelled while
+ * no other job waits for the same data, the download is aborted as well
+ * (HTTP/1.1 servers allow only about 6 connections per host).
+ */
+function waitFor<T>(cache: Map<string, SharedLoad<T>>, key: string, entry: SharedLoad<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return entry.promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  entry.waiters++;
+  return new Promise<T>((resolve, reject) => {
+    let done = false;
+    const release = (): boolean => {
+      if (done) return false;
+      done = true;
+      entry.waiters--;
+      signal.removeEventListener('abort', onAbort);
+      return true;
+    };
+    const onAbort = (): void => {
+      if (!release()) return;
+      if (entry.waiters === 0 && !entry.settled) {
+        entry.controller.abort();
+        if (cache.get(key) === entry) cache.delete(key);
+      }
+      reject(abortError());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    entry.promise.then(
+      (value) => {
+        if (release()) resolve(value);
+      },
+      (err: unknown) => {
+        if (release()) reject(err);
+      },
+    );
+  });
+}
 
 function fillTemplate(url: string, z: number, x: number, y: number): string {
   return url.replace('{z}', String(z)).replace('{x}', String(x)).replace('{y}', String(y));
 }
 
-async function fetchHeightImage(src: RasterTerrainSource, z: number, x: number, y: number): Promise<HeightImage> {
-  const res = await fetch(fillTemplate(src.url, z, x, y), { mode: 'cors', credentials: 'omit' });
+async function fetchHeightImage(src: RasterTerrainSource, z: number, x: number, y: number, signal: AbortSignal): Promise<HeightImage> {
+  const res = await fetch(fillTemplate(src.url, z, x, y), { mode: 'cors', credentials: 'omit', signal });
   if (!res.ok) throw new Error(`terrain HTTP ${res.status}`);
   const blob = await res.blob();
   // Keep raw bytes: no color management or premultiplication, or the decoded heights drift.
@@ -63,23 +143,11 @@ async function fetchHeightImage(src: RasterTerrainSource, z: number, x: number, 
   return { width, height, data };
 }
 
-function getHeightImage(src: RasterTerrainSource, z: number, x: number, y: number): Promise<HeightImage> {
+/** Decoded elevation tile; `signal` is the waiting job's (omit for prefetches). */
+function getHeightImage(src: RasterTerrainSource, z: number, x: number, y: number, signal?: AbortSignal): Promise<HeightImage> {
   const key = `${src.id}/${z}/${x}/${y}`;
-  let entry = heightCache.get(key);
-  if (entry) {
-    // Refresh LRU position.
-    heightCache.delete(key);
-    heightCache.set(key, entry);
-    return entry;
-  }
-  entry = fetchHeightImage(src, z, x, y);
-  heightCache.set(key, entry);
-  entry.catch(() => heightCache.delete(key));
-  while (heightCache.size > HEIGHT_CACHE_SIZE) {
-    const oldest = heightCache.keys().next().value as string;
-    heightCache.delete(oldest);
-  }
-  return entry;
+  const entry = sharedLoad(heightCache, key, (s) => fetchHeightImage(src, z, x, y, s));
+  return waitFor(heightCache, key, entry, signal);
 }
 
 /** Bilinear sample of a height image at normalized coordinates (0,0 = north-west corner). */
@@ -103,7 +171,7 @@ function sourceTileFor(req: BuildTileRequest, src: RasterTerrainSource) {
   return rasterSourceTile(req.level, req.x, req.y, src.maxZoom, terrainLevelOffset(src.tileSize ?? 256, req.segments));
 }
 
-async function sampleTerrainGrid(req: BuildTileRequest, src: RasterTerrainSource): Promise<Float32Array> {
+async function sampleTerrainGrid(req: BuildTileRequest, src: RasterTerrainSource, signal: AbortSignal): Promise<Float32Array> {
   const N = req.segments;
   const { x, y } = req;
   // Each mesh tile samples a sub-rectangle of a coarser elevation tile.
@@ -111,7 +179,7 @@ async function sampleTerrainGrid(req: BuildTileRequest, src: RasterTerrainSource
   const scale = 1 / 2 ** dz;
   const offU = (x - sx * 2 ** dz) * scale;
   const offV = (y - sy * 2 ** dz) * scale;
-  const img = await getHeightImage(src, sz, sx, sy);
+  const img = await getHeightImage(src, sz, sx, sy, signal);
 
   const heights = new Float32Array((N + 1) * (N + 1));
   for (let j = 0; j <= N; j++) {
@@ -138,30 +206,25 @@ interface GeoTile {
   grid: Float32Array;
 }
 
-const geoCache = new Map<string, Promise<GeoTile | null>>();
+const geoCache = new Map<string, SharedLoad<GeoTile | null>>();
 
-/** Loads a geographic terrain tile, falling back to ancestors when it is not available. */
-function loadGeoTile(src: QuantizedMeshTerrainSource, level: number, x: number, y: number): Promise<GeoTile | null> {
+/**
+ * Loads a geographic terrain tile, falling back to ancestors when it is not
+ * available. `signal` is the waiting job's (omit for prefetches).
+ */
+function loadGeoTile(src: QuantizedMeshTerrainSource, level: number, x: number, y: number, signal?: AbortSignal): Promise<GeoTile | null> {
   const key = `${src.id}/${level}/${x}/${y}`;
-  let entry = geoCache.get(key);
-  if (entry) {
-    geoCache.delete(key);
-    geoCache.set(key, entry);
-    return entry;
-  }
-  entry = (async (): Promise<GeoTile | null> => {
-    const parent = () => (level > 0 ? loadGeoTile(src, level - 1, x >> 1, y >> 1) : Promise.resolve(null));
+  const entry = sharedLoad(geoCache, key, async (s): Promise<GeoTile | null> => {
+    // The fallback waits on behalf of this load, so cancelling it releases the parent too.
+    const parent = () => (level > 0 ? loadGeoTile(src, level - 1, x >> 1, y >> 1, s) : Promise.resolve(null));
     if (!isTileAvailable(src.available, level, x, y)) return parent();
-    const res = await fetch(fillTemplate(src.url, level, x, y), { headers: src.headers, mode: 'cors', credentials: 'omit' });
+    const res = await fetch(fillTemplate(src.url, level, x, y), { headers: src.headers, mode: 'cors', credentials: 'omit', signal: s });
     if (res.status === 404 || res.status === 204) return parent();
     if (!res.ok) throw new Error(`terrain HTTP ${res.status}`);
     const tile = decodeQuantizedMesh(await res.arrayBuffer());
     return { level, x, y, grid: rasterizeQuantizedMesh(tile, QM_GRID) };
-  })();
-  geoCache.set(key, entry);
-  entry.catch(() => geoCache.delete(key));
-  while (geoCache.size > HEIGHT_CACHE_SIZE) geoCache.delete(geoCache.keys().next().value as string);
-  return entry;
+  });
+  return waitFor(geoCache, key, entry, signal);
 }
 
 /** Geographic tiles (level, column, row range) covering a mercator mesh tile. */
@@ -181,7 +244,7 @@ function geoTilesFor(req: BuildTileRequest, src: QuantizedMeshTerrainSource) {
   return { g, gx, rowOf, r0: rowOf(latS), r1: rowOf(latN - 1e-9) };
 }
 
-async function sampleQuantizedMesh(req: BuildTileRequest, src: QuantizedMeshTerrainSource): Promise<Float32Array> {
+async function sampleQuantizedMesh(req: BuildTileRequest, src: QuantizedMeshTerrainSource, signal: AbortSignal): Promise<Float32Array> {
   const N = req.segments;
   const row = N + 1;
   const n = 2 ** req.level;
@@ -194,7 +257,7 @@ async function sampleQuantizedMesh(req: BuildTileRequest, src: QuantizedMeshTerr
   const { g, gx, rowOf, r0, r1 } = geoTilesFor(req, src);
   const tiles = new Map<number, GeoTile | null>();
   await Promise.all(
-    Array.from({ length: r1 - r0 + 1 }, (_, i) => r0 + i).map(async (r) => tiles.set(r, await loadGeoTile(src, g, gx, r))),
+    Array.from({ length: r1 - r0 + 1 }, (_, i) => r0 + i).map(async (r) => tiles.set(r, await loadGeoTile(src, g, gx, r, signal))),
   );
 
   const heights = new Float32Array(row * row);
@@ -323,17 +386,11 @@ function buildMesh(req: BuildTileRequest, heights: Float32Array | null, src: Ter
   const sagitta = (segment * segment) / (8 * WGS84_A);
   const skirtDepth = Math.max(20, segment * 0.15, sagitta * 3) + (heights ? 0.5 * (maxHeight - minHeight) : 0);
 
-  // Edge vertex indices, each traversed so the skirt faces outward.
-  const edges: number[][] = [[], [], [], []];
-  for (let i = N; i >= 0; i--) edges[0].push(i); // north: east -> west
-  for (let i = 0; i <= N; i++) edges[1].push(N * row + i); // south: west -> east
-  for (let j = 0; j <= N; j++) edges[2].push(j * row); // west: north -> south
-  for (let j = N; j >= 0; j--) edges[3].push(j * row + N); // east: south -> north
+  // Edge vertex indices, each traversed so the skirt faces outward (layout: tileMeshLayout.ts).
+  const edges = edgeVertices(N);
 
   let s = gridCount;
-  const skirtStart: number[] = [];
   for (const edge of edges) {
-    skirtStart.push(s);
     for (const k of edge) {
       ecef[s * 3] = ecef[k * 3] - normals64[k * 3] * skirtDepth;
       ecef[s * 3 + 1] = ecef[k * 3 + 1] - normals64[k * 3 + 1] * skirtDepth;
@@ -367,39 +424,7 @@ function buildMesh(req: BuildTileRequest, heights: Float32Array | null, src: Ter
     radiusSq = Math.max(radiusSq, dx * dx + dy * dy + dz * dz);
   }
 
-  const indexCount = N * N * 6 + 4 * N * 6;
-  const indices = vertexCount > 65535 ? new Uint32Array(indexCount) : new Uint16Array(indexCount);
-  let p = 0;
-  for (let j = 0; j < N; j++) {
-    for (let i = 0; i < N; i++) {
-      const a = j * row + i;
-      const b = a + row;
-      const c = a + 1;
-      const d = b + 1;
-      indices[p++] = a;
-      indices[p++] = b;
-      indices[p++] = c;
-      indices[p++] = c;
-      indices[p++] = b;
-      indices[p++] = d;
-    }
-  }
-  for (let e = 0; e < 4; e++) {
-    const edge = edges[e];
-    const base = skirtStart[e];
-    for (let k = 0; k < N; k++) {
-      const e0 = edge[k];
-      const e1 = edge[k + 1];
-      const s0 = base + k;
-      const s1 = base + k + 1;
-      indices[p++] = e0;
-      indices[p++] = s0;
-      indices[p++] = e1;
-      indices[p++] = e1;
-      indices[p++] = s0;
-      indices[p++] = s1;
-    }
-  }
+  const indices = buildTileIndices(N, vertexCount);
 
   const horizonPoint = computeHorizonCullingPoint(center[0], center[1], center[2], ecef, gridCount);
 
@@ -433,7 +458,8 @@ function prefetchTerrain(req: BuildTileRequest, src: TerrainSource): void {
 }
 
 async function handleBuild(req: BuildTileRequest): Promise<void> {
-  pending.add(req.id);
+  const job = new AbortController();
+  jobs.set(req.id, job);
   try {
     const src = req.terrainId ? (sources.get(req.terrainId) ?? null) : null;
     if (req.terrainId && !src) throw new Error(`unknown terrain source ${req.terrainId}`);
@@ -441,12 +467,12 @@ async function handleBuild(req: BuildTileRequest): Promise<void> {
     if (src && req.upsample) {
       const u = req.upsample;
       const heights = upsampleHeightGrid(u.heights, u.segments, u.level, u.x, u.y, req.level, req.x, req.y, req.segments);
-      prefetchTerrain(req, src);
+      if (req.prefetch !== false) prefetchTerrain(req, src);
       tile = buildMesh(req, heights, src, true);
       tile.upsampled = true;
     } else {
-      const heights = src ? await (isQuantizedMesh(src) ? sampleQuantizedMesh(req, src) : sampleTerrainGrid(req, src)) : null;
-      if (cancelled.delete(req.id)) {
+      const heights = src ? await (isQuantizedMesh(src) ? sampleQuantizedMesh(req, src, job.signal) : sampleTerrainGrid(req, src, job.signal)) : null;
+      if (job.signal.aborted) {
         post({ type: 'error', id: req.id, message: 'cancelled', aborted: true });
         return;
       }
@@ -456,11 +482,9 @@ async function handleBuild(req: BuildTileRequest): Promise<void> {
     if (tile.heights) transfer.push(tile.heights.buffer);
     post(tile, transfer);
   } catch (err) {
-    const aborted = cancelled.delete(req.id);
-    post({ type: 'error', id: req.id, message: err instanceof Error ? err.message : String(err), aborted });
+    post({ type: 'error', id: req.id, message: err instanceof Error ? err.message : String(err), aborted: job.signal.aborted });
   } finally {
-    pending.delete(req.id);
-    cancelled.delete(req.id);
+    jobs.delete(req.id);
   }
 }
 
@@ -472,5 +496,5 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const msg = event.data;
   if (msg.type === 'source') sources.set(msg.source.id, msg.source);
   else if (msg.type === 'build') void handleBuild(msg);
-  else if (msg.type === 'cancel' && pending.has(msg.id)) cancelled.add(msg.id);
+  else if (msg.type === 'cancel') jobs.get(msg.id)?.abort();
 };

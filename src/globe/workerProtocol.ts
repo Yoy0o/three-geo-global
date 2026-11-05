@@ -29,6 +29,11 @@ export interface BuildTileRequest {
    * requests the exact mesh later.
    */
   upsample?: UpsampleSource | null;
+  /**
+   * With `upsample`: start downloading the exact terrain right away (default
+   * true). Off for meshes built ahead of need (tiles just outside the view).
+   */
+  prefetch?: boolean;
 }
 
 export interface CancelRequest {
