@@ -64,6 +64,26 @@ interface SharedNodes {
 }
 
 let shared: SharedNodes | null = null;
+
+/**
+ * `materialReference` to a texture property that gets a texture binding of
+ * its own. three merges uniform nodes with the same hash into one binding,
+ * and a texture node's hash is the uuid of the texture it holds when the
+ * shader is built (`TextureNode.getUniformHash`). Tile materials start out
+ * with `imageryMap === fadeMap`, so the shared tile shader used to sample one
+ * texture through both: every cross-fade blended the old picture with a
+ * shrunken copy of it (tile-sized ghost copies), then snapped to the new one.
+ */
+function textureReference(property: string): TSLNode {
+  const ref: TSLNode = materialReference(property, 'texture');
+  // ReferenceNode creates its texture node lazily; give it a hash of its own.
+  const setNodeType = ref.setNodeType.bind(ref);
+  ref.setNodeType = (type: string) => {
+    setNodeType(type);
+    ref.node.getUniformHash = () => `globeTile.${property}`;
+  };
+  return ref;
+}
 const placeholder = new Texture();
 placeholder.flipY = false;
 
@@ -115,16 +135,17 @@ function sharedNodes(): SharedNodes {
   })();
 
   const imageryUV = uv().mul(imageryTransform.zw).add(imageryTransform.xy);
-  const imagery: TSLNode = (materialReference('imageryMap', 'texture') as TSLNode).context({ getUV: () => imageryUV });
+  const imagery: TSLNode = textureReference('imageryMap').context({ getUV: () => imageryUV });
   // Cross-fade source. Sampled unconditionally (texture fetches must stay in uniform
   // control flow); when not fading it is the same texels as `imagery`, so it is ~free.
+  // Its binding must stay separate from `imagery`'s even then (see `textureReference`).
   const fadeTransform: TSLNode = materialReference('fadeTransform', 'vec4');
   const fadeUV = uv().mul(fadeTransform.zw).add(fadeTransform.xy);
-  const previous: TSLNode = (materialReference('fadeMap', 'texture') as TSLNode).context({ getUV: () => fadeUV });
+  const previous: TSLNode = textureReference('fadeMap').context({ getUV: () => fadeUV });
   const fade: TSLNode = materialReference('fade', 'float');
   const overlayTransform: TSLNode = materialReference('overlayTransform', 'vec4');
   const overlayUV = uv().mul(overlayTransform.zw).add(overlayTransform.xy);
-  const overlay: TSLNode = (materialReference('overlayMap', 'texture') as TSLNode).context({ getUV: () => overlayUV });
+  const overlay: TSLNode = textureReference('overlayMap').context({ getUV: () => overlayUV });
 
   const colorNode = Fn(() => {
     const albedo = vec3(mix(previous.rgb, imagery.rgb, fade)).toVar();
