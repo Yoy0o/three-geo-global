@@ -8,6 +8,9 @@ import {
   IMAGERY_COALESCE_MS,
   IMAGERY_GROUP_WAIT_MS,
   imagerySwitchDue,
+  PREFETCH_MAX_FOVEATION,
+  PREFETCH_SSE_RATIO,
+  shouldPrefetchChildren,
   selectionIn,
   TileSelection,
   wouldLoseDetail,
@@ -138,5 +141,19 @@ describe('imagery reveal', () => {
     expect(imagerySwitchDue(0, true, false, true)).toBe(true);
     expect(imagerySwitchDue(IMAGERY_GROUP_WAIT_MS - 1, true, false, false)).toBe(false);
     expect(imagerySwitchDue(IMAGERY_GROUP_WAIT_MS, true, false, false)).toBe(true);
+  });
+});
+
+describe('next-level prefetch', () => {
+  const threshold = 1.25;
+
+  it('prefetches tiles about one zoom step from refining, near the view center', () => {
+    expect(shouldPrefetchChildren(threshold * 0.9, threshold, 0)).toBe(true);
+    expect(shouldPrefetchChildren(threshold * PREFETCH_SSE_RATIO, threshold, PREFETCH_MAX_FOVEATION)).toBe(true);
+  });
+
+  it('skips tiles far from refining or away from the center', () => {
+    expect(shouldPrefetchChildren(threshold * PREFETCH_SSE_RATIO * 0.99, threshold, 0)).toBe(false);
+    expect(shouldPrefetchChildren(threshold, threshold, PREFETCH_MAX_FOVEATION + 0.01)).toBe(false);
   });
 });

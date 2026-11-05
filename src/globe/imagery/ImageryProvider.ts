@@ -18,6 +18,13 @@ export interface ImageryProvider {
    * loads, so the rest wait in its own priority queue.
    */
   readonly maxConcurrentRequests?: number;
+  /**
+   * Downloads a tile into the browser's HTTP cache without decoding it (no
+   * main-thread or GPU cost), so a later `requestImage` is a cache hit. The
+   * globe uses it for the next level around the view center while idle.
+   * Optional; providers without it are never prefetched.
+   */
+  prefetch?(level: number, x: number, y: number, signal: AbortSignal): Promise<void>;
   requestImage(level: number, x: number, y: number, signal: AbortSignal): Promise<ImageBitmap | null>;
   /** Raw encoded tile, when the provider can supply it (lets callers cache compressed bytes). */
   requestBlob?(level: number, x: number, y: number, signal?: AbortSignal): Promise<Blob | null>;
@@ -44,6 +51,12 @@ export interface XYZImageryOptions {
    * aborted (that would close the connection). See `RequestScheduler`.
    */
   maxRequestsPerHost?: number;
+  /**
+   * Let the globe prefetch the next level into the HTTP cache (default true).
+   * Turn off for services with request quotas (e.g. Tianditu keys) or without
+   * HTTP caching.
+   */
+  prefetch?: boolean;
 }
 
 /** Decodes an image off the main thread. */
@@ -73,6 +86,8 @@ export class XYZImageryProvider implements ImageryProvider {
     this.subdomains = options.subdomains ?? [];
     this.params = options.params ?? {};
     this.perHost = options.maxRequestsPerHost;
+    // No method at all when disabled: the globe only prefetches providers that have one.
+    if (options.prefetch === false) this.prefetch = undefined;
     if (this.perHost !== undefined) {
       const hosts = this.url.includes('{s}') ? Math.max(1, this.subdomains.length) : 1;
       this.maxConcurrentRequests = this.perHost * hosts;
@@ -102,6 +117,20 @@ export class XYZImageryProvider implements ImageryProvider {
     const blob = await this.requestBlob(level, x, y, signal);
     return blob ? decodeImage(blob) : null;
   }
+
+  prefetch?: (level: number, x: number, y: number, signal: AbortSignal) => Promise<void> = async (level, x, y, signal) => {
+    const url = this.tileUrl(level, x, y);
+    // Same mode and credentials as `fetchTileBlob`, so the cache entry is reused. No `priority: 'low'`:
+    // Chrome then holds the request back behind others for a second or more; the globe already
+    // starts prefetches only when nothing visible is waiting.
+    const warm = async (s: AbortSignal | undefined) => {
+      const res = await fetch(url, { signal: s, mode: 'cors', credentials: 'omit' });
+      // The body must be read for the response to be stored.
+      await res.arrayBuffer();
+    };
+    if (this.perHost === undefined) return warm(signal);
+    return scheduleRequest(hostOf(url), { limit: this.perHost, signal }, warm);
+  };
 }
 
 async function fetchTileBlob(url: string, signal: AbortSignal | undefined): Promise<Blob | null> {

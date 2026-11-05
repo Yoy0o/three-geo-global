@@ -29,7 +29,17 @@ import type { ImageryProvider } from './imagery/ImageryProvider';
 import { isQuantizedMesh, type TerrainSource } from './terrain/TerrainSource';
 import { rasterSourceTile, terrainLevelOffset } from './terrain/terrainTiling';
 import { extractQuads, morphDeltas, quadrantQuads, tileVertexCount } from './tileMeshLayout';
-import { childUvTransform, fogRelaxedError, horizonFogDensity, imagerySwitchDue, selectionIn, TileSelection, wouldLoseDetail } from './tileSelection';
+import {
+  childUvTransform,
+  fogRelaxedError,
+  horizonFogDensity,
+  imagerySwitchDue,
+  PREFETCH_MAX_ACTIVE,
+  selectionIn,
+  shouldPrefetchChildren,
+  TileSelection,
+  wouldLoseDetail,
+} from './tileSelection';
 import type { BuiltTile, UpsampleSource } from './workerProtocol';
 
 export interface GlobeOptions {
@@ -67,6 +77,14 @@ export interface GlobeOptions {
    * meshes that need no download). Default true.
    */
   preloadSiblings?: boolean;
+  /**
+   * While no drawn tile waits for imagery, download the next level's imagery
+   * around the view center into the browser's HTTP cache (no decoding, no GPU
+   * upload; at most `PREFETCH_MAX_ACTIVE` requests), so zooming in shows the
+   * final imagery almost at once. Providers opt out with `prefetch: false`.
+   * Default true.
+   */
+  prefetchImagery?: boolean;
 }
 
 export interface GlobeStats {
@@ -85,6 +103,8 @@ export interface GlobeStats {
   fills: number;
   /** Rendered tiles holding back better imagery, to reveal it together with their siblings (or with sharper ancestors). */
   heldImagery: number;
+  /** Next-level imagery downloads in flight into the HTTP cache. */
+  prefetching: number;
 }
 
 type ChannelKind = 'geo' | 'img' | 'ovl';
@@ -185,7 +205,7 @@ export class Globe {
   readonly group = new Group();
   readonly scheme = new WebMercatorTilingScheme();
   readonly ellipsoid = Ellipsoid.WGS84;
-  readonly stats: GlobeStats = { rendered: 0, cached: 0, loading: 0, queued: 0, maxLevel: 0, waitingImagery: 0, keptForDetail: 0, fills: 0, heldImagery: 0 };
+  readonly stats: GlobeStats = { rendered: 0, cached: 0, loading: 0, queued: 0, maxLevel: 0, waitingImagery: 0, keptForDetail: 0, fills: 0, heldImagery: 0, prefetching: 0 };
 
   maxScreenSpaceError: number;
   maxCachedTiles: number;
@@ -198,6 +218,8 @@ export class Globe {
   fogScreenSpaceErrorFactor: number;
   /** See `GlobeOptions.preloadSiblings`. */
   preloadSiblings: boolean;
+  /** See `GlobeOptions.prefetchImagery`. */
+  prefetchImagery: boolean;
   /** Stop refining and loading (debug). */
   freeze = false;
   /** Called (at most a few times per provider) when imagery requests fail. */
@@ -220,6 +242,11 @@ export class Globe {
   private ready: ReadyItem[] = [];
   private readonly fading = new Set<GlobeTile>();
   private readonly morphing = new Set<GlobeTile>();
+  // Next-level prefetch (HTTP cache only): tiles already asked for (insertion order = age), downloads in flight,
+  // and the signal that drops waiting ones when the provider changes.
+  private readonly prefetched = new Set<string>();
+  private prefetchActive = 0;
+  private prefetchAbort = new AbortController();
   private renderList: GlobeTile[] = [];
   private prevRenderList: GlobeTile[] = [];
   /** Quadrant meshes drawn this frame for children without a mesh yet (see `GlobeTile.fills`). */
@@ -264,6 +291,7 @@ export class Globe {
     this.morphDuration = options.morphDuration ?? 0.4;
     this.fogScreenSpaceErrorFactor = options.fogScreenSpaceErrorFactor ?? 1;
     this.preloadSiblings = options.preloadSiblings ?? true;
+    this.prefetchImagery = options.prefetchImagery ?? true;
     this.group.name = 'Globe';
 
     const placeholderTex = new DataTexture(new Uint8Array([28, 46, 72, 255]), 1, 1);
@@ -306,6 +334,7 @@ export class Globe {
     this.capColors[0].clear();
     this.capColors[1].clear();
     for (const t of this.active.img) t.img.loading?.abort();
+    this.resetPrefetch();
   }
 
   /** Drapes a tile overlay source (e.g. rasterized vector layers) over the imagery. */
@@ -401,7 +430,9 @@ export class Globe {
     this.dispatch('geo', this.maxConcurrentGeometry);
     // HTTP/1.1 imagery servers take only a few requests at once: dispatch no more than that, so
     // the rest wait in the priority queue (which is re-sorted every frame) instead of the browser's.
-    this.dispatch('img', Math.min(this.maxConcurrentLoads, this.imagery.maxConcurrentRequests ?? Infinity));
+    const imageryLimit = Math.min(this.maxConcurrentLoads, this.imagery.maxConcurrentRequests ?? Infinity);
+    this.dispatch('img', Math.max(1, imageryLimit - this.prefetchActive));
+    this.prefetchNextLevel(imageryLimit);
     this.dispatch('ovl', Math.max(4, Math.floor(this.maxConcurrentLoads / 3)));
     this.updateFades();
     this.updateMorphs();
@@ -416,6 +447,7 @@ export class Globe {
     this.stats.waitingImagery = waiting;
     this.stats.keptForDetail = kept;
     this.stats.heldImagery = held;
+    this.stats.prefetching = this.prefetchActive;
     this.stats.fills = this.fillList.length;
   }
 
@@ -844,6 +876,64 @@ export class Globe {
         if (ch.loading && !ch.loading.signal.aborted && this.frame - ch.wantedFrame > STALE_FRAMES) ch.loading.abort();
       }
     }
+  }
+
+  /**
+   * Warms the HTTP cache with the next level's imagery around the view center
+   * (docs/agents/tile-loading.md §3.2). Uses spare capacity only: nothing
+   * starts while imagery for a drawn tile (or one blocking a level change)
+   * still waits for a request slot; ancestors kept as fallbacks (`B_LOW`)
+   * do not hold it back. At most
+   * `PREFETCH_MAX_ACTIVE` downloads run, which the imagery dispatch leaves
+   * free. Each tile is asked for once per provider.
+   */
+  private prefetchNextLevel(imageryLimit: number): void {
+    const provider = this.imagery;
+    if (!this.prefetchImagery || !provider.prefetch || this.freeze) return;
+    for (const t of this.queues.img) if (t.img.bucket < B_LOW && !t.img.loading && this.now >= t.img.retryAt) return;
+    let free = Math.min(PREFETCH_MAX_ACTIVE, imageryLimit) - this.prefetchActive;
+    if (free <= 0) return;
+
+    const candidates: { tile: GlobeTile; foveation: number }[] = [];
+    for (const t of this.renderList) {
+      // Settled tiles only: own imagery shown, children within the provider's range.
+      if (t.keptForDetail || t.level + 1 > provider.maxZoom || t.imageryGen !== this.imageryGen) continue;
+      const foveation = this.foveation(t);
+      if (shouldPrefetchChildren(this.computeSSE(t), this.maxScreenSpaceError, foveation)) candidates.push({ tile: t, foveation });
+    }
+    candidates.sort((a, b) => a.foveation - b.foveation);
+
+    const signal = this.prefetchAbort.signal;
+    for (const { tile } of candidates) {
+      for (let i = 0; i < 4 && free > 0; i++) {
+        const level = tile.level + 1;
+        const x = tile.x * 2 + (i & 1);
+        const y = tile.y * 2 + (i >> 1);
+        const child = tile.children?.[i];
+        if (child && child.imageryGen === this.imageryGen) continue;
+        const key = `${level}/${x}/${y}`;
+        if (this.prefetched.has(key)) continue;
+        this.prefetched.add(key);
+        if (this.prefetched.size > 4096) this.prefetched.delete(this.prefetched.values().next().value as string);
+        free--;
+        this.prefetchActive++;
+        provider
+          .prefetch(level, x, y, signal)
+          .catch(() => undefined)
+          .finally(() => {
+            // A provider switch has reset the count already.
+            if (!signal.aborted) this.prefetchActive--;
+          });
+      }
+      if (free <= 0) break;
+    }
+  }
+
+  private resetPrefetch(): void {
+    this.prefetchAbort.abort();
+    this.prefetchAbort = new AbortController();
+    this.prefetchActive = 0;
+    this.prefetched.clear();
   }
 
   /** Marks a load as in flight; returns its controller. */
@@ -1679,6 +1769,7 @@ export class Globe {
     for (const tex of this.capTextures) tex.dispose();
     this.placeholder.release();
     this.emptyOverlay.release();
+    this.resetPrefetch();
     this.workers.dispose();
     this.imagery.dispose?.();
   }

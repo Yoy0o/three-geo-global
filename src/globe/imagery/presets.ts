@@ -91,6 +91,8 @@ export const IMAGERY_PRESETS: ImageryPreset[] = [
         minZoom: 1,
         maxZoom: 18,
         params: { tk: key },
+        // Keys have a daily request quota: do not spend it on prefetching.
+        prefetch: false,
         attribution: '© 天地图 / 国家地理信息公共服务平台',
       }),
   },
@@ -142,6 +144,8 @@ export const OVERLAY_PRESETS: OverlayPreset[] = [
         minZoom: 1,
         maxZoom: 18,
         params: { tk: key },
+        // Keys have a daily request quota: do not spend it on prefetching.
+        prefetch: false,
         attribution: '© 天地图',
       }),
   },

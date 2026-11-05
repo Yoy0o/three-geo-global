@@ -145,3 +145,23 @@ export function imagerySwitchDue(waitedMs: number, own: boolean, fromPlaceholder
   if (own) return siblingsReady || waitedMs >= IMAGERY_GROUP_WAIT_MS;
   return waitedMs >= IMAGERY_COALESCE_MS;
 }
+
+/** A drawn tile's children are prefetched once its error is at least this share of the threshold (about one zoom step away). */
+export const PREFETCH_SSE_RATIO = 0.5;
+/** Only tiles this close to the view center are prefetched (units of the half diagonal FOV, 0 = center). */
+export const PREFETCH_MAX_FOVEATION = 0.4;
+/** Prefetch downloads in flight at most (HTTP/1.1 servers have about 6 connections). */
+export const PREFETCH_MAX_ACTIVE = 2;
+
+/**
+ * Whether the imagery of a drawn tile's children is worth downloading ahead
+ * of need: the tile is close to refining and near the view center, where the
+ * user zooms in. Only the HTTP cache is warmed (see `ImageryProvider.prefetch`).
+ *
+ * @param sse The tile's screen-space error in CSS pixels.
+ * @param threshold The refinement threshold (`maxScreenSpaceError`).
+ * @param foveation Angle from the view center in units of the half diagonal FOV.
+ */
+export function shouldPrefetchChildren(sse: number, threshold: number, foveation: number): boolean {
+  return sse >= threshold * PREFETCH_SSE_RATIO && foveation <= PREFETCH_MAX_FOVEATION;
+}
