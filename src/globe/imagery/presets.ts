@@ -2,6 +2,9 @@ import { DebugImageryProvider } from './DebugImageryProvider';
 import { EquirectangularImageryProvider } from './EquirectangularImageryProvider';
 import { XYZImageryProvider, type ImageryProvider } from './ImageryProvider';
 
+/** server.arcgisonline.com speaks HTTP/1.1 only; browsers open 6 connections per host. */
+const ARCGIS_CONNECTIONS = 6;
+
 export interface ImageryPreset {
   id: string;
   name: string;
@@ -19,6 +22,7 @@ export const IMAGERY_PRESETS: ImageryPreset[] = [
         id: 'esri-imagery',
         name: 'ArcGIS World Imagery',
         url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        maxRequestsPerHost: ARCGIS_CONNECTIONS,
         maxZoom: 19,
         attribution: 'Imagery © Esri, Maxar, Earthstar Geographics, GIS User Community',
       }),
@@ -69,6 +73,7 @@ export const IMAGERY_PRESETS: ImageryPreset[] = [
         id: 'esri-topo',
         name: 'ArcGIS World Topo',
         url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
+        maxRequestsPerHost: ARCGIS_CONNECTIONS,
         maxZoom: 19,
         attribution: 'Tiles © Esri and contributors',
       }),
@@ -149,6 +154,7 @@ export const OVERLAY_PRESETS: OverlayPreset[] = [
         id: 'esri-places',
         name: 'Esri Boundaries & Places',
         url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
+        maxRequestsPerHost: ARCGIS_CONNECTIONS,
         maxZoom: 19,
         attribution: 'Labels © Esri and contributors',
       }),
@@ -162,6 +168,7 @@ export const OVERLAY_PRESETS: OverlayPreset[] = [
         id: 'esri-transport',
         name: 'Esri Transportation',
         url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Transportation/MapServer/tile/{z}/{y}/{x}',
+        maxRequestsPerHost: ARCGIS_CONNECTIONS,
         maxZoom: 19,
         attribution: 'Roads © Esri and contributors',
       }),
