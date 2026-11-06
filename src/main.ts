@@ -23,6 +23,7 @@ function syncHash(viewer: GeoViewer): void {
   window.setInterval(() => {
     if (viewer.controller.isFlying) return;
     const v = viewer.getView();
+    if (![v.longitude, v.latitude, v.height].every(Number.isFinite)) return;
     const hash = `#${v.longitude.toFixed(5)},${v.latitude.toFixed(5)},${v.height.toFixed(0)},${v.heading.toFixed(1)},${v.pitch.toFixed(1)}`;
     if (hash !== last) {
       last = hash;

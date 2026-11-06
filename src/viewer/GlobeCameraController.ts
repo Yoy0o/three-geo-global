@@ -147,6 +147,10 @@ export class GlobeCameraController {
   private flightTarget: FlightTarget | null = null;
   private flightDone: (() => void) | null = null;
   private changed = true;
+  /** Last finite camera pose, restored if a degenerate input ever produces NaN. */
+  private readonly safePosition = new Vector3();
+  private readonly safeQuaternion = new Quaternion();
+  private hasSafePose = false;
 
   constructor(private readonly host: ControllerHost) {
     this.camera = host.camera;
@@ -279,7 +283,33 @@ export class GlobeCameraController {
   // Per-frame update
 
   update(dt: number): void {
-    dt = Math.min(dt, 0.1);
+    this.step(Number.isFinite(dt) ? Math.min(dt, 0.1) : 0);
+    this.keepFinite();
+  }
+
+  /**
+   * A NaN pose (from a degenerate gesture, e.g. with a zero-size viewport)
+   * would stick forever and even end up in the URL hash: put back the last
+   * valid pose instead.
+   */
+  private keepFinite(): void {
+    const p = this.camera.position;
+    const q = this.camera.quaternion;
+    if (Number.isFinite(p.x + p.y + p.z + q.x + q.y + q.z + q.w)) {
+      this.safePosition.copy(p);
+      this.safeQuaternion.copy(q);
+      this.hasSafePose = true;
+      return;
+    }
+    if (!this.hasSafePose) return;
+    p.copy(this.safePosition);
+    q.copy(this.safeQuaternion);
+    this.cancelMotion();
+    this.markChanged();
+    console.warn('[GlobeCameraController] discarded a non-finite camera pose');
+  }
+
+  private step(dt: number): void {
     if (this.flight) {
       const running = this.flight.update(dt, this.camera.position, this.camera.quaternion);
       this.markChanged();
@@ -347,7 +377,14 @@ export class GlobeCameraController {
 
   private ndc(clientX: number, clientY: number, out = new Vector2()): Vector2 {
     const rect = this.dom.getBoundingClientRect();
+    // Zero-size viewport (minimized window): no meaningful position, use the center.
+    if (!(rect.width > 0 && rect.height > 0)) return out.set(0, 0);
     return out.set(((clientX - rect.left) / rect.width) * 2 - 1, -((clientY - rect.top) / rect.height) * 2 + 1);
+  }
+
+  /** Gestures need a viewport with an area (a minimized window reports 0 x 0). */
+  private hasViewport(): boolean {
+    return this.dom.clientWidth > 0 && this.dom.clientHeight > 0;
   }
 
   private cancelMotion(): void {
@@ -365,7 +402,7 @@ export class GlobeCameraController {
   private readonly onContextMenu = (e: Event) => e.preventDefault();
 
   private readonly onPointerDown = (e: PointerEvent) => {
-    if (!this.enabled) return;
+    if (!this.enabled || !this.hasViewport()) return;
     try {
       this.dom.setPointerCapture(e.pointerId);
     } catch {
@@ -547,6 +584,7 @@ export class GlobeCameraController {
   private readonly onWheel = (e: WheelEvent) => {
     if (!this.enabled || !this.enableZoom) return;
     e.preventDefault();
+    if (!this.hasViewport()) return;
     this.cancelFlight();
     this.stopAutoOrbit();
     this.spinVelocity = 0;

@@ -175,4 +175,5 @@ docs/agents/    子系统规范（本文档的展开）
 - **TSL 纹理槽被合并**：three 按哈希合并 uniform，纹理节点的哈希是编译时所持纹理的 uuid。两个 `materialReference(..., 'texture')` 在编译时指向同一张纹理，就会共用一个绑定，之后各自赋不同纹理也没用。瓦片的交叉淡入因此一直在混合"旧画面 + 缩小的旧画面"（重影、错位副本），这是加载闪烁的根因。需要同时采样多张纹理时用 `TileMaterial.textureReference` 这种固定独立哈希的写法。
 - **影像逐格闪烁**：每块瓦片影像一到就各自淡入，祖先影像逐级到达时还会连续淡入好几次，画面像棋盘一样闪。屏幕上的瓦片换影像要走 `updateShownImagery`（合并中间层级、兄弟成组揭示，tile-loading.md §2），不要在影像到达时直接 `resolveImagery(tile, true)`。
 - **HTTP/1.1 影像源排队失控**：浏览器每个域名只开约 6 个连接，多派发的请求在浏览器里先来先服务，优先级失效，屏幕中心要等十几秒才清晰。HTTP/1.1 的源（如 `server.arcgisonline.com`）必须在预设里声明 `maxRequestsPerHost`，见 tile-loading.md §3.1。
+- **零尺寸视口**：窗口最小化时 canvas 宽高为 0，手势算出的 NDC 是 NaN，会把相机永久写成 NaN，`syncHash` 还会把它写进 URL。控制器已在视口为零时忽略手势，并在每帧检查位姿、恢复到上一个有效位姿。自动化测试遇到窗口最小化时，要伪造视口尺寸，或者改用只驱动逻辑的测试方式。
 - **Windows 环境**：`python` 可能只是应用商店的占位程序，脚本请用 Node；Bash 中使用 POSIX 路径。
