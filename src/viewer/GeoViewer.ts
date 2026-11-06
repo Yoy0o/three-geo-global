@@ -29,6 +29,8 @@ import { OverlayCompositor } from '../globe/OverlayCompositor';
 import type { BimEntity } from '../indoor/BimEntity';
 import { IndoorManager } from '../indoor/IndoorManager';
 import { MarkerManager } from '../markers/MarkerManager';
+import { PointLayer, type PointLayerOptions } from '../markers/PointLayer';
+import type { PointRecord } from '../markers/points';
 import { Tiles3DLayer, type LoaderKit, type Tiles3DLayerOptions } from '../tiles3d/Tiles3DLayer';
 import type { NodeMaterialLibrary } from '../tiles3d/nodeMaterials';
 import { GeoJsonLayer, type GeoJsonLayerOptions } from '../vector/GeoJsonLayer';
@@ -103,6 +105,9 @@ export interface ViewerEvents extends Record<string, unknown> {
   frame: FrameStats;
   'tilesets-changed': Tiles3DLayer[];
   'vectors-changed': GeoJsonLayer[];
+  'points-changed': PointLayer[];
+  /** A point marker of a point layer was clicked. */
+  'point-click': { point: PointRecord; layer: PointLayer; event: MouseEvent };
 }
 
 export interface FeaturePick {
@@ -157,6 +162,8 @@ export class GeoViewer {
   readonly vectorLayers: GeoJsonLayer[] = [];
   /** HTML markers / top cards (顶牌) anchored to world positions. */
   readonly markers: MarkerManager;
+  /** Data-driven point marker layers (点位), drawn through `markers`. */
+  readonly pointLayers: PointLayer[] = [];
   /** Pointer events resolved to scene objects (click / dblclick / hover with selectors). */
   readonly interaction: InteractionManager;
   /** Buildings, floors, rooms and equipment; indoor level navigation. */
@@ -543,6 +550,36 @@ export class GeoViewer {
     this.events.emit('vectors-changed', this.vectorLayers);
   }
 
+  // ---------------------------------------------------------------------------
+  // Point markers (点位)
+
+  /**
+   * Adds a point marker layer: GeoJSON points, record arrays or a
+   * `{ points, style, rules }` document (see docs/agents/markers.md).
+   */
+  addPoints(options: PointLayerOptions): PointLayer {
+    const layer = new PointLayer(options, {
+      ellipsoid: this.ellipsoid,
+      markers: this.markers,
+      groundHeight: (lon, lat, maxCellSize) => (this._showGlobe ? this.globe.getHeight(lon, lat, maxCellSize) : 0),
+      flyToBBox: (bbox) => void this.flyToBBox(bbox),
+    });
+    this.pointLayers.push(layer);
+    layer.events.on('ready', () => this.events.emit('points-changed', this.pointLayers));
+    layer.events.on('error', () => this.events.emit('points-changed', this.pointLayers));
+    layer.events.on('click', (e) => this.events.emit('point-click', e));
+    this.events.emit('points-changed', this.pointLayers);
+    return layer;
+  }
+
+  removePoints(layer: PointLayer): void {
+    const i = this.pointLayers.indexOf(layer);
+    if (i < 0) return;
+    this.pointLayers.splice(i, 1);
+    layer.dispose();
+    this.events.emit('points-changed', this.pointLayers);
+  }
+
   /** Flies to fit a [west, south, east, north] box in degrees (top-down view). */
   flyToBBox(bbox: [number, number, number, number], duration?: number): Promise<void> {
     const [w, s, e, n] = bbox;
@@ -653,6 +690,8 @@ export class GeoViewer {
     this.labels.update(this.camera, this.container.clientWidth, this.container.clientHeight, dt);
 
     this.renderer.render(this.scene, this.camera);
+    // Point layers clamp to the terrain and cluster before the markers are placed.
+    for (const layer of this.pointLayers) layer.update(this.camera, this.container.clientWidth, this.container.clientHeight);
     this.markers.update(this.camera, this.container.clientWidth, this.container.clientHeight);
     this.updateStats(dt, performance.now() - t0);
   }
@@ -758,6 +797,7 @@ export class GeoViewer {
     this.interaction.dispose();
     for (const layer of [...this.tilesets]) this.removeTileset(layer);
     for (const layer of [...this.vectorLayers]) this.removeGeoJson(layer);
+    for (const layer of [...this.pointLayers]) this.removePoints(layer);
     this.indoor.dispose();
     this.markers.dispose();
     this.labels.dispose();
