@@ -71,7 +71,8 @@ npm test           # 核心数学单元测试（vitest）
 **地球与数据**
 - WGS84 椭球数学（Newton 迭代投影、ENU 坐标系、射线求交），全部 float64
 - Web Mercator 四叉树：屏幕空间误差（以“影像纹素占多少 CSS 像素”计）选择 LOD、视锥裁剪 + 椭球地平线裁剪（Cesium 的 horizon culling point）、裙边消除裂缝、极地补盖（颜色取自影像边缘）
-- 加载调度（[规范](docs/agents/tile-loading.md)）：几何 / 影像 / 叠加三条独立通道与并发上限；五级优先级桶 + **视野中心优先**；跨级“锚点”影像（大跨度缩放一个往返就变清晰）；新影像**交叉淡入**；每帧上传预算 + 背压；离开视野自动取消、指数退避重试、叶子优先的 LRU 淘汰；首屏根瓦片先以平面立即显示
+- 加载调度（[规范](docs/agents/tile-loading.md)）：几何 / 影像 / 叠加三条独立通道与并发上限；五级优先级桶 + **视野中心优先**；跨级“锚点”影像（大跨度缩放一个往返就变清晰）；新影像**交叉淡入**；每帧上传预算 + 背压；离开视野自动取消（立即释放槽位并中止无人等待的下载）、指数退避重试、叶子优先的 LRU 淘汰；首屏根瓦片先以平面立即显示
+- **缩放不闪烁**（借鉴 CesiumJS 的四叉树选择）：选择结果记忆；缩小时父瓦片的影像和地形就绪前保留子瓦片（不丢细节）；子瓦片刚进入视野时用父瓦片象限填充；视野外兄弟瓦片预建插值网格；地平线雾化 SSE
 - 地形取数比网格低 3 级（一张 256 px 高程图服务 8×8 个网格瓦片，请求量降到 1/64 且不损失精度）；子瓦片先用**精确祖先**高度插值出临时网格（≤3 级）立即可渲染，真实地形随后替换；临时网格的子瓦片用保守包围体，杜绝空洞；相机防入地只采信足够精细的地形
 - 影像源：XYZ 模板（ArcGIS、OSM、Carto、天地图等预设 + 自定义 URL）、单张等经纬度全球图、离线调试网格
 - 叠加图层：天地图影像注记、Esri 边界地名 / 交通、Carto 注记、OpenRailwayMap 等半透明图层，可调不透明度、顺序、显隐；与矢量栅格一起**合成为每个瓦片的一张叠加纹理**，着色器始终只多一次纹理采样；压缩瓦片缓存，矢量变化时不重复下载
@@ -111,8 +112,8 @@ npm test           # 核心数学单元测试（vitest）
 
 **交互、顶牌与相机（参考 ThingJS，[对照表](docs/agents/thingjs-reference.md)、[运行时源码分析](docs/agents/thingjs-runtime-analysis.md)）**
 - 统一事件：`viewer.interaction.on('click' | 'dblclick' | 'rightclick' | 'mousemove' | 'mouseenter' | 'mouseleave', fn, { selector, tag })`，选择器冒泡、标签批量注销、`preventDefault()` 屏蔽默认行为
-- 点位标注（[规范](docs/agents/markers.md)）：`viewer.addPoints()` 加载 GeoJSON 点或记录数组；8 种样式（水滴图钉、呼吸点、徽章、光柱、文字等）；按属性的样式规则与文本模板；自动贴地；屏幕空间聚合（点击放大）；点击查看属性
 - HTML 顶牌：float64 投影、地平线 / 距离 / 视口裁剪、优先级避让；数据驱动显示模式（常显 / 进入层级后 / 悬停 / 点击）；卡片 / 图钉 / 标签三种样式
+- 点位标注（[规范](docs/agents/markers.md)）：`viewer.addPoints()` 加载 GeoJSON 点或记录数组；8 种样式（水滴图钉、呼吸点、徽章、光柱、文字等）；按属性的样式规则与文本模板；自动贴地；屏幕空间聚合（点击放大）；点击查看属性
 - 自研相机控制器（[规范](docs/agents/camera-controller.md)）：零 roll、俯视不翻转的航向算法、保持姿态的光标缩放、右键航向 / 俯仰、俯仰范围、手势开关、环绕巡航、惯性、触屏、键盘、按可靠地形防入地
 - 相机 API：`flyTo`、`flyToTarget({ target, heading, pitch, range })`、`flyToSphere`、`flyToEntity`、`startAutoOrbit`、`resetNorth`；大圆弧线飞行
 - 图层面板、状态栏（帧率 / GPU 耗时 / 瓦片与待影像统计 / 相机与光标经纬高）、层级条、指北针、数据署名
@@ -227,6 +228,7 @@ viewer.interaction.on('click', (e) => console.log(e.object?.properties), { selec
 **近期（v0.2）——数据与可用性**
 - 地形与 3D Tiles 统一高程查询（贴地、防入地都考虑 3D Tiles 表面）；瓦片边界法线拼接
 - 矢量进阶：MVT 矢量瓦片、面拉伸（建筑白模）、沿线注记（点位标注与聚合已完成）
+- 升级 three r187：瓦片材质改用 `NodeMaterialInstance`，遮挡查询按相机正确，`BatchedMesh` 合并绘制（[路线图 M0](docs/agents/roadmap.md)）
 - 3D Tiles 要素拾取与属性查询（EXT_mesh_features / batch table），高亮；接入统一事件
 - 临时地形到精确地形的几何形变过渡；Worker 间共享高程缓存
 - 室内：IFC 直读（web-ifc）与按楼层流式加载、剖切面 / 剖切盒、室内导航、设备实例化渲染、实体描边

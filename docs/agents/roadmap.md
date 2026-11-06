@@ -1,6 +1,6 @@
 # 可借鉴与复用路线图
 
-> 版本：2026-11-04。本文是后续开发的总路线：把外部来源中可借鉴、可复用的内容，对照本仓库现状和 three.js r186 的内置能力，整理成分阶段的落地计划。外部代码只做了静态阅读和检索，没有安装或执行。
+> 版本：2026-11-04，2026-11-05 按 three.js r187 复核（见 §8）。本文是后续开发的总路线：把外部来源中可借鉴、可复用的内容，对照本仓库现状和 three.js 的内置能力，整理成分阶段的落地计划。外部代码只做了静态阅读和检索，没有安装或执行。
 >
 > 文中"参考平台"指一款商业数字孪生平台的浏览器运行时（闭源，只公开构建产物）；"t3d 生态"指开源的 t3d.js 渲染库及其配套扩展仓库。两类来源可以互相印证：参考平台里观察到的不少机制（拾取缓冲、静止超采样、后期缓冲依赖、遮挡查询、锚点矩阵），在 t3d 生态里都有公开实现。
 
@@ -10,8 +10,16 @@
    - **直接用 three r186 内置**：描边、TRAA / SSAA、GTAO / SSR、OIT、成簇光照、级联阴影、高斯泼溅、遮挡查询、异步像素回读、`BatchedMesh`、宽线。这些在 t3d 里是自研扩展，three 已经现成，不再移植。
    - **移植算法（BSD-3 / MIT，保留版权声明）**：three 没有、或不适合我们场景的部分。包括拾取缓冲布局、静止超采样、遮挡代理管理、贡献剔除、八面体冒名顶替、IDW / 热力场生成、路线与带洞挤出构建器、阴影范围适配、动态字形图集。CPU 部分大多是纯函数，可以直接放进 Worker。
    - **只借鉴设计**：参考平台的层级控制、选择器、事件选项、取景策略、样式池、可见性驱动加载、IoT 数据管线。对方只有构建产物公开，按思路自研。
-2. 按依赖关系排成 5 个里程碑：M1 室内层级与交互框架 → M2 拾取、遮挡与顶牌 → M3 画质与性能 → M4 孪生数据与空间分析 → M5 工程与工具（持续）。
-3. 最先做的 3 件事：**层级控制策略化（M1.1）**、**选择器表达式（M1.5）**、**GPU 拾取缓冲（M2.1）**。后两者是后面大多数功能的前置条件。
+2. 按依赖关系排成 6 个里程碑：M0 升级 three r187（前置）→ M1 室内层级与交互框架 → M2 拾取、遮挡与顶牌 → M3 画质与性能 → M4 孪生数据与空间分析 → M5 工程与工具（持续）。
+3. 最先做的 3 件事：**层级控制策略化（M1.1）**、**选择器表达式（M1.5）**、**GPU 拾取缓冲（M2.1）**。后两者是后面大多数功能的前置条件。M0 不阻塞 M1，但必须在 M2.2、M3.6 之前完成。
+4. **2026-11-05 复核结论**（§8）：
+   - 与 three 官方的进展没有方向冲突。
+   - 有 4 处需要修正：
+     - r186 的 `BatchedMesh` 在 WebGPU 上每个实例单独一次 draw，到 r187 才开始合并。
+     - r186 的遮挡查询在多相机下会串结果，r187 修复。
+     - r187 新增 `NodeMaterialInstance`，正是我们瓦片材质的写法，可直接替换。
+     - 静止超采样、楼层 AO、阴影和帧快照，three 已有更完整的内置或 addon 方案，应先评估再决定是否自研。
+   - 已完成：地球瓦片调度借鉴 CesiumJS 的改造（选择记忆、不丢细节守卫、象限填充、兄弟预建、雾化 SSE、取消即释放），见 [tile-loading.md](tile-loading.md)；点位标注（样式、规则、聚合），见 [markers.md](markers.md)。
 
 ## 1. 来源与许可
 
@@ -41,7 +49,7 @@
 
 ## 2. 能力对照总表
 
-"决策"一列：**内置** = 直接用 three r186；**移植** = 按 t3d 源码改写为 TSL / TypeScript；**自研** = 按参考平台的设计自己实现。
+"决策"一列：**内置** = 直接用 three 自带的能力（核心或随包发布、版本随 three 锁定的 `three/addons`）；**移植** = 按 t3d 源码改写为 TSL / TypeScript；**自研** = 按参考平台的设计自己实现。"three" 一列按 r186 写，r187 的变化另行标出（§8）。
 
 | 能力 | 参考平台 | t3d 生态 | three r186 | 我们现状 | 决策 | 里程碑 |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -51,20 +59,20 @@
 | 选择器 | 编译缓存的布尔表达式 + 标签 | — | — | 只支持逗号"或" | 自研 | M1.5 |
 | 事件选项 | 优先级、once、停止传播、暂停 | — | — | 选择器、标签、`preventDefault` | 自研 | M1.6 |
 | GPU 拾取 | ID + 深度缓冲，按需刷新 | `PickBuffer`：法线、视深、id 一次输出 | `readRenderTargetPixelsAsync`、`setRenderObjectFunction`、位转换节点 | 指针移动时 CPU 射线 | 移植布局 + 内置 API | M2.1 |
-| 遮挡查询、顶牌遮挡 | 查拾取缓冲深度 | `OcclusionProxyManager` | `occlusionTest` / `isOccluded` | 无 | 内置 + 移植管理方式 | M2.2 |
+| 遮挡查询、顶牌遮挡 | 查拾取缓冲深度 | `OcclusionProxyManager` | `occlusionTest` / `isOccluded`；r186 多相机共用渲染上下文时会串结果，r187 改为按相机保存 | 无 | 内置（r187 起）+ 移植管理方式 | M2.2 |
 | 贡献剔除 | — | 示例 `renderer_culling_contribution` | — | 无 | 移植 | M2.3 |
 | 后期框架 | 配置驱动 | 权重排序 + 缓冲依赖 + 逐物体标记 | `RenderPipeline` + `pass` + `mrt` | 无后期 | 借鉴架构，用内置节点 | M3.1 |
 | 描边、x-ray | 按颜色分组 | 标记缓冲（区分是否深度测试） | `OutlineNode`（可见边 / 被挡边分色） | emissive 高亮 | 内置 | M3.2 |
 | 逐物体发光 | — | Glow / InnerGlow / SoftGlow | `mrtNode` + 选择性泛光 | 无 | 内置 + 标记约定 | M3.2 |
-| 静止超采样 | 静止时累积约 30 帧 | `SuperSampling` / `CameraJitter` | —（TRAA 需要速度缓冲） | 每帧渲染 + MSAA | 移植 | M3.3 |
+| 静止超采样 | 静止时累积约 30 帧 | `SuperSampling` / `CameraJitter` | `TRAANode`、`TAAUNode`、`TemporalReprojectNode`（需要速度缓冲；相机静止时退化为抖动累积） | 每帧渲染 + MSAA | 先评估内置，不满足再移植 | M3.3 |
 | 调色 | 默认对比度、饱和度 1.1 | ColorCorrection | 色彩函数节点 | 无 | 内置 | M3.3 |
-| 楼层 AO 烘焙 | 俯视渲染墙体 + 多级模糊 | — | — | 无 | 自研 | M3.4 |
-| 光照跟随大气 | 环境贴图按局部坐标定向 | 太阳色、天光球谐、深度雾 | `LightProbe`、`scene.fogNode` | 只有地球瓦片有空气透视 | 自研（复用我们的大气节点） | M3.5 |
-| 合批、样式池 | 按唯一键共享 + 自动实例化 | `BatchedMesh`、实例化材质 | `BatchedMesh`、`InstancedMesh` | 每个实体一份材质 | 内置 + 自研池 | M3.6 |
+| 楼层 AO 烘焙 | 俯视渲染墙体 + 多级模糊 | — | `SSAONode`、`GTAONode`（屏幕空间）；r187 `LightMapper` + `unwrapUVs`（漫反射烘焙） | 无 | 自研轻量烘焙，完整光照烘焙用内置 | M3.4 |
+| 光照跟随大气 | 环境贴图按局部坐标定向 | 太阳色、天光球谐、深度雾 | `LightProbe`、`LightProbeGrid`（WebGPU 版）、`SunLight`（级联阴影）、`scene.fogNode` | 只有地球瓦片有空气透视 | 自研（复用我们的大气节点），光源用内置 | M3.5 |
+| 合批、样式池 | 按唯一键共享 + 自动实例化 | `BatchedMesh`、实例化材质 | `InstancedMesh`；`BatchedMesh` 在 WebGPU 上 r186 每实例一次 draw，r187 合并同几何的连续实例；r187 `NodeMaterialInstance` | 每个实体一份材质 | 内置（r186 用 `InstancedMesh`）+ 自研池 | M3.6 |
 | 冒名顶替 | — | `OctahedralImpostor` | 无 | 无 | 移植 | M3.7 |
 | 楼层按需加载 | 可见即加载、隐藏可卸载 | — | — | 加载建筑时全部加载 | 自研 | M3.8 |
-| 透明排序 | — | 加权混合 / 深度剥离 OIT | `OITPassNode` | 默认排序 | 内置 | M3.9 |
-| 阴影 | 阴影贴图交给地球着色器 | `LightShadowAdapter` | `CSMShadowNode` | 无 | 内置 + 移植范围适配 | M3.9 |
+| 透明排序 | — | 加权混合 / 深度剥离 OIT | `OITPassNode`（addon） | 默认排序 | 内置 | M3.9 |
+| 阴影 | 阴影贴图交给地球着色器 | `LightShadowAdapter` | `SunLight`、`CSMShadowNode`、`TileShadowNode`（r187 用仅深度渲染目标） | 无 | 内置 + 移植范围适配 | M3.9 |
 | 场强图 | — | IDW / 热力图生成器 | 计算节点 | 无 | 移植 | M4.1 |
 | 路线、管线 | — | `RouteBuilder`、`TubeBuilder` | `TubeGeometry`（依赖 three） | 无 | 移植（Worker 版） | M4.2 |
 | 带洞多边形、挤出、边线 | 房间支持洞 | Polygon / ExtrudeShape / Edges 构建器 | `ShapeUtils`、`EdgesGeometry`（依赖 three） | 主线程生成，房间不支持洞 | 移植（Worker 版） | M4.3 |
@@ -72,10 +80,37 @@
 | IoT 数据 | 订阅、批量发布、适配器 | — | — | 静态属性 | 自研 | M4.5 |
 | 高频数值标签 | 字体图集在 Worker 生成 | `DynamicFont` | — | 整段文字光栅化 | 移植 | M4.6 |
 | 天际线、贴花、剖切 | 天际线分析 | `SkylineEffect`、`Decal` | 裁剪平面 | 无 | 移植 | M4.7 |
-| 全景、高斯泼溅、粒子、假室内、天气 | 有 | `t3d-pano`、`t3d-particle`、示例、weather | `GaussianSplat`、计算节点、`exponentialHeightFogFactor` | 无 | 按项选择 | M4.8 |
-| 帧图、帧快照 | — | zenfg（FrameGraph + Snapshot） | — | 状态栏统计 | 评估 | M5 |
+| 全景、高斯泼溅、粒子、假室内、天气 | 有 | `t3d-pano`、`t3d-particle`、示例、weather | `GaussianSplat`（addon，含 PLY / SPZ / glTF 加载）、计算节点、`exponentialHeightFogFactor` | 无 | 按项选择 | M4.8 |
+| 帧图、帧快照 | — | zenfg（FrameGraph + Snapshot） | `Inspector`（addon：CPU / GPU 时间、时间线、TSL 图）；r187 `renderer.drawingPipeline` | 状态栏统计 | 基于 Inspector 扩展；FrameGraph 仍只评估 | M5 |
+| 点位标注 | 顶牌、点位聚合 | — | —（HTML 层自研） | **已完成**：8 种样式、规则、聚合 | 自研 | [markers.md](markers.md) |
+| 地球瓦片调度 | — | — | — | **已完成**：借鉴 CesiumJS 的选择记忆、不丢细节、象限填充 | 自研 | [tile-loading.md](tile-loading.md) |
 
 ## 3. 里程碑
+
+### M0 升级 three r187 与材质实例（P0，前置）
+
+- **范围**：
+  - `three` 0.186.1 → 0.187.x（2026-10-30 发布），`@types/three` 0.187.0。
+  - `3d-tiles-renderer` 0.5.3 → 0.5.4（peer 要求 `three >=0.167.0`）。
+  - 按 AGENTS.md §1，升级前要征得同意，并锁定精确版本。
+- **收益**（只列与本仓库直接相关的）：
+  - 反向深度的几处修复：深度函数映射（#35264）、多边形偏移（#34606）、ArrayCamera 深度清除值（#34804）、首帧阴影（#34801）。我们全程使用反向 Z。
+  - 遮挡查询结果按相机保存（#35066），这是 M2.2 的前提。
+  - `NodeMaterialInstance`（#34684 引入，#35269 定名）：多个实例共享一次着色器构建，每个实例保存自己的属性，节点图用 `materialReference()` 读取。这正是 `TileMaterial` 现在的写法（每块瓦片一个 `MeshBasicNodeMaterial`，共享同一组节点），可以直接替换。PR 的基准测试里，首帧耗时从 2039 ms 降到 162 ms。
+  - `BatchedMesh` 合并同几何的连续实例（#35259），这是 M3.6 的前提。
+  - `compileAsync()` 并行编译管线（#34816），可用于启动预热；新增仅深度渲染目标（#34782，`count: 0`）。
+- **迁移检查**（186 → 187 共 9 项，已逐项对照本仓库）：
+  - TSL 运算的隐式类型提升（#33695）：要复查 `TileMaterial`、`AtmosphereNodes`、`nodeMaterials` 的输出有无变化（截图对比）。
+  - PMREM 改为立方体渲染目标、`CubeUVReflectionMapping` 移除：未使用。
+  - 灯光注册改为 `Light.registerNode()`：我们没有自定义灯光。`renderer.library.fromMaterial` 仍然保留（已核对 r187 源码）。
+  - 结构体存储缓冲统一按数组处理、`pixelationPass` 参数类型、`iridescenceThicknessRange` 废弃：均未使用。
+  - `setAnimationLoop(null)` 不再启动内部循环（首次使用时才启动）：与现有用法兼容。
+- **步骤**：
+  1. 升级依赖，跑 typecheck / test / build。
+  2. 按 AGENTS.md §6.3 手测，并对大气、瓦片、3D Tiles 截图对比。
+  3. 瓦片材质改用 `NodeMaterialInstance`，用 `viewer.stats.frameMs` 和 Inspector 对比新瓦片的首帧耗时。
+  4. 更新 AGENTS.md §1 的版本说明。
+- **验收**：功能和画面没有回归；快速缩放时，新瓦片带来的帧时间尖峰明显下降。
 
 ### M1 室内层级与交互框架（P0）
 
@@ -160,6 +195,10 @@
 - **调度**：半分辨率渲染；场景变化时标脏，最多每 0.25 s 刷新一次。用 `readRenderTargetPixelsAsync` 异步回读整张缓冲，悬停和点击都只查 CPU 端数组。
 - **位置**：用视深和渲染该帧时缓存的投影矩阵，求相机相对坐标（float32 足够），再加上相机的 ECEF 坐标（float64）。
 - **兜底**：WebGL 回退模式或缓冲还没就绪时，继续用现在的 CPU 射线。
+- **与 r187 的关系**：
+  - r187 的 `VisibilityBufferDrawingPipeline`（`three/addons/pipelines/`）输出的是 meshlet 簇的可见性缓冲，只覆盖它支持的对象，WebGL 后端会回退。它不能直接当拾取缓冲用，本节的拾取 pass 仍然需要。
+  - 可以借助 r187 的仅深度渲染目标，用 `NodeMaterialInstance` 减少拾取材质的构建开销。
+  - r187 新增的 `renderer.drawingPipeline` 可作为替换绘制流程的正式入口，不必再改渲染器内部。
 - 验收：
   - 单测覆盖八面体编解码和深度反投影。
   - 手测场景有 1000 个以上设备时，悬停的每帧 CPU 耗时不随数量增长。
@@ -168,6 +207,7 @@
 **M2.2 遮挡查询与顶牌遮挡**（工作量：中）
 
 - 使用 three 内置的遮挡查询。给需要遮挡判断的顶牌挂一个极小的代理：不写颜色、不写深度、在不透明物体之后绘制，设 `occlusionTest = true`；下一帧用 `renderer.isOccluded(proxy)` 判断。
+- 依赖 M0：r186 里，不同相机渲染到同一目标（例如分屏、小地图）时共用渲染上下文，`isOccluded()` 会返回另一个相机的结果（#35065）。r187 改为按相机保存。留在 r186 的话，只能在单相机场景里使用。
 - 代理的管理照搬 t3d `OcclusionProxyManager`：固定容量、回收空闲索引、异步同步结果、只在状态变化时回调。
 - 顶牌新增 `occlusion: 'none' | 'hide' | 'fade'`，默认 `none`。告警卡片只允许 `fade`，不能完全隐藏，与 AGENTS.md"重要信息不参与避让"一致。
 - M2.1 完成后，也可以改为查拾取缓冲的深度，省掉代理绘制。
@@ -177,6 +217,7 @@
 
 - 每隔几帧，计算设备和构件包围球在屏幕上的精确投影范围（t3d `renderer_culling_contribution` 示例的算法）。小于阈值（默认屏幕的 0.5%）就不渲染。
 - 建筑结构和楼板不参与剔除；加 10% 回差，避免在阈值附近闪烁。
+- 与 r187 `MeshletDrawingPipeline` 的关系：它在 GPU 上按簇做视锥、法线锥和两阶段遮挡剔除，并按屏幕空间误差选 LOD，适合高面数模型；但只覆盖它支持的对象。设备级的贡献剔除放在 CPU 上，只有几行代码，仍然需要。
 - 验收：单测覆盖屏幕范围计算；手测远景时小设备消失，拉近后恢复。
 
 ### M3 画质与性能（P1）
@@ -198,10 +239,12 @@
 **M3.3 按需渲染与静止超采样**（工作量：中）
 
 - 按需渲染：相机（`controller.consumeChanged()`）、瓦片加载、动画、顶牌都没有变化时，不再渲染新帧。
-- 静止超采样（移植 t3d `SuperSampling` / `CameraJitter`）：
-  1. 静止后按 Halton(2, 3) 序列抖动投影矩阵，第一帧不抖动。
-  2. 逐帧混合到累积缓冲，累积 16–30 帧后停止渲染。
-  3. 有任何变化立即重置。
+- 静止超采样：先验证 three 的 `TRAANode` / `TemporalReprojectNode`（相机静止时，它们就是抖动后逐帧累积）。
+  - 我们的地球瓦片用自定义 `positionNode` 和 RTC 原点，要先确认 `highPrecision` 下速度缓冲是否正确。
+  - 内置方案不满足时，再移植 t3d `SuperSampling` / `CameraJitter`。移植版只在静止时启用，不需要速度缓冲：
+    1. 静止后按 Halton(2, 3) 序列抖动投影矩阵，第一帧不抖动。
+    2. 逐帧混合到累积缓冲，累积 16–30 帧后停止渲染。
+    3. 有任何变化立即重置。
 - 调色：对比度、饱和度可调，提供 1.05 左右的默认预设。
 - 验收：静止时 GPU 占用接近零，状态栏显示"已静止"；画面收敛、不闪烁；一拖动就恢复实时渲染。全天常亮的大屏收益最大。
 
@@ -213,6 +256,7 @@
   3. 楼板的第二套 UV 用本地 XY 坐标，按楼层包围盒归一化。
   4. 楼板材质通过 `materialReference` 乘上 AO，所有楼板共享一个节点图。
 - 只在加载时花一次开销；楼层移除时释放贴图。
+- 与内置能力的分工：需要完整的漫反射光照烘焙时，用 r187 的 `LightMapper` + `unwrapUVs`（实时生成光照贴图 UV）；屏幕空间 AO 用 `GTAONode` / `SSAONode`。这里只要"墙根变暗"的近似效果，自研的俯视模糊只需几毫秒，两者不冲突。
 
 **M3.5 光照跟随大气**（工作量：中）
 
@@ -224,9 +268,10 @@
 
 **M3.6 合批与样式池**（工作量：中）
 
-- 同模型、同样式的设备合成 `BatchedMesh`（或 `InstancedMesh`），批次索引映射回实体，这也就是 M2.1 需要的实例 id。逐实例的颜色和透明度覆盖走批次属性。
-- 材质按"资源 + 样式"的唯一键共享，带引用计数（参考平台的样式池）。
-- 验收：1 万个设备时绘制调用少于 100 次，帧耗时达标。
+- 同模型、同样式的设备合成 `InstancedMesh`，实例索引映射回实体，这也就是 M2.1 需要的实例 id。逐实例的颜色和透明度覆盖走实例属性。
+- **`BatchedMesh` 要等 M0**：WebGPU 没有 multi-draw，r186 的 WebGPU 后端对每个可见实例单独调用一次 `drawIndexed()`，1 万实例就是 1 万次 draw。r187（#35259）开始把共享同一几何范围的连续实例合并成一次实例化绘制，所以要按几何分组添加，并关闭排序或保证同几何相邻。
+- 材质按"资源 + 样式"的唯一键共享，带引用计数（参考平台的样式池）。r187 起，同一节点图的不同样式用 `NodeMaterialInstance`，共享一次着色器构建。
+- 验收：1 万个设备时绘制调用少于 100 次（r186 只能用 `InstancedMesh` 达到），帧耗时达标。
 
 **M3.7 八面体冒名顶替**（工作量：中）
 
@@ -240,7 +285,7 @@
 
 - 透明：玻璃幕墙等大量透明面用 three 的 `OITPassNode`（加权混合 OIT）。
 - 阴影：
-  - 建筑和设备的投影用 `CSMShadowNode`，或一张平行光阴影。
+  - 建筑和设备的投影先评估 `SunLight`（r186 起支持 WebGPURenderer，自带级联阴影）和 `TileShadowNode`（r187），再考虑 `CSMShadowNode` 或一张平行光阴影。
   - 阴影范围按"建筑包围盒 ∩ 视锥"自动适配，做法同 t3d `LightShadowAdapter`：先用平面裁剪包围盒多边形，再求阴影相机范围。
   - 地球瓦片材质接收同一张阴影；阴影矩阵按 RTC 原点换算，不能用 ECEF 绝对值。
 
@@ -296,7 +341,10 @@
 ### M5 工程与工具（持续）
 
 - **M5.1 帧快照**：一键导出当前帧的 pass 列表、资源数量、耗时，以及 Globe 和 3D Tiles 统计（JSON），用于人工或 AI 辅助排查（zenfg Snapshot 的思路）。
+  - 基于 three 的 `Inspector` addon 扩展，不另起炉灶。Inspector 已有 CPU / GPU 时间、时间线、TSL 节点图、分屏对比，r187 修正了跳帧时的 FPS 与 GPU 时间统计。
+  - 我们只需加一个 Globe / 3D Tiles / 顶牌统计面板和 JSON 导出；节点构建统计可以挂 `renderer.debug.onNodeBuilderCreated`（r186）。
 - **M5.2 FrameGraph 评估**：等出现 three 之外的自定义 WebGPU 计算（GPU 剔除、计算着色器拾取）时，再评估 zenfg。
+  - r187 新增 `renderer.drawingPipeline`（Standard / Meshlet / VisibilityBuffer 三种绘制管线），配合 `RenderPipeline`，引入第三方 FrameGraph 的必要性进一步降低。
   - 它允许外部引擎作为不透明节点，与图内节点共享设备和附件。
   - 目前是 0.2 版，只支持原生 WebGPU。
   - 共享设备并不会自动统一纹理格式和深度约定，我们用的是反向 Z。
@@ -306,6 +354,9 @@
 
 ```mermaid
 flowchart LR
+  U["M0 升级 r187"] --> O
+  U --> B
+  U --> MI["瓦片材质改 NodeMaterialInstance"]
   S["M1.5 选择器 + 标签"] --> L["M1.1 层级控制"]
   L --> P["M1.2 路径切换 / 视点缓存"]
   L --> V["M1.3 取景与聚焦"]
@@ -323,7 +374,7 @@ flowchart LR
   M["M3.8 楼层按需加载"] --> E
 ```
 
-建议的执行顺序：M1.5 → M1.1 → M1.2 / M1.3 / M1.4 → M1.6 → M3.6 → M2.1 → M2.2 / M2.3 → M3.1 → M3.2 / M3.3 → 其余各项按需求排期。
+建议的执行顺序：M0（可与 M1 并行）→ M1.5 → M1.1 → M1.2 / M1.3 / M1.4 → M1.6 → M3.6 → M2.1 → M2.2 / M2.3 → M3.1 → M3.2 / M3.3 → 其余各项按需求排期。
 
 ## 5. 不复用的部分
 
@@ -351,3 +402,63 @@ flowchart LR
 
 - 2026-11-04 通过 GitHub API 列出仓库，只稀疏克隆源码目录（共约 12 MB，不含示例资源）；只做静态阅读和检索，没有安装依赖，也没有执行任何代码。
 - 逐项对照本仓库 `node_modules` 中 three r186.1 的源码，确认"内置"一列的能力确实存在，例如 `isOccluded`、`setRenderObjectFunction`、`readRenderTargetPixelsAsync`、`OutlineNode`、`OITPassNode`、`ClusteredLightsNode`、`GaussianSplat`、`scene.fogNode`、`packSnorm2x16`。
+- 2026-11-05 复核（§8）：
+  - 重新在 r186.1 源码中检索上述符号，全部存在。其中 `GaussianSplat`、`OITPassNode`、`OutlineNode`、`TRAANode`、`ClusteredLightsNode` 位于 `examples/jsm`（addons）。
+  - 阅读 r186、r187 的官方发布说明，以及迁移指南 184→185、185→186、186→187 三节。
+  - 通过 GitHub API 阅读关键 PR 的说明：#34684、#35269、#35191、#35066、#35259、#34782、#34622。
+  - 核对 r187 的 `NodeLibrary.js` 源码，以及 npm 上 `three`、`@types/three`、`3d-tiles-renderer` 的最新版本。
+
+## 8. 与 three.js 官方进展的对照（2026-11-05）
+
+### 8.1 版本与方向
+
+| 项 | 现状 |
+| --- | --- |
+| 本仓库锁定 | three 0.186.1（r186，2026-09-24 发布），3d-tiles-renderer 0.5.3 |
+| 最新 | three 0.187.0（r187，2026-10-30），`@types/three` 0.187.0，3d-tiles-renderer 0.5.4（peer `three >=0.167.0`） |
+| 官方路线图 | three.js 没有成文的路线图，下面的方向是从 r183–r187 的发布内容归纳的 |
+
+归纳出的官方方向，以及对我们的含义：
+
+1. **WebGPURenderer + TSL 是主线**。WebGLRenderer 只做缺陷修复和小功能；`PostProcessing` 在 r183 改名为 `RenderPipeline`，`renderAsync()` 等在 r181 废弃。我们已经全面使用 WebGPURenderer、TSL 和新名字，没有冲突。
+2. **GPU 驱动渲染**：r187 新增 `renderer.drawingPipeline`，以及 `MeshletDrawingPipeline`（簇剔除、两阶段遮挡、按屏幕误差选 LOD）和 `VisibilityBufferDrawingPipeline`。
+   - 这会和我们的 M2.3 贡献剔除、M3.7 冒名顶替部分重叠，但对象粒度不同（簇与设备），不冲突。
+   - 高面数 BIM 模型优先交给 meshlet 管线。
+3. **全局光照与光源**：r186 起有 `SunLight`（级联阴影，支持 WebGPU）、WebGPU 版 `LightProbeGrid`、`VXGINode`；r187 增加 `LightMapper` 和 `unwrapUVs`。M3.4、M3.5、M3.9 的"光源 / 阴影本体"用内置，我们只做大气驱动和 ECEF 大坐标适配。
+4. **后期节点持续增强**：`SSAONode`（r186）、`GTAONode`、`SSRNode`、`SSGINode`、`TAAUNode`、`TemporalReprojectNode`、`OITPassNode`（r186）。M3.3 的静止超采样先评估内置的时域方案。
+5. **材质实例化**：r187 新增 `NodeMaterialInstance`，与我们 `materialReference` 的用法一致，见 M0。
+6. **工具**：`Inspector` addon（时间线、GPU 时间、TSL 节点图），M5.1 基于它扩展。
+
+### 8.2 冲突检查结论
+
+| 本路线图条目 | 是否与 three 冲突 | 处理 |
+| --- | --- | --- |
+| M1 层级控制、选择器、事件选项 | 否。three 不提供应用层的层级和选择器 | 按原计划 |
+| M2.1 GPU 拾取 | 否。three 没有拾取缓冲；r187 的可见性缓冲只覆盖 meshlet 管线 | 按原计划，利用 r187 仅深度渲染目标和 `NodeMaterialInstance` |
+| M2.2 遮挡查询 | r186 有多相机缺陷 | 依赖 M0 |
+| M2.3 贡献剔除 | 与 meshlet 剔除部分重叠，粒度不同 | 保留（CPU，设备级） |
+| M3.1 / M3.2 后期与描边 | 否，直接用内置 | r187 起 `OutlineNode` 支持自定义 `positionNode`，可以用于我们的瓦片和 BIM |
+| M3.3 静止超采样 | 与 `TRAANode` 等可能重复 | 先评估内置 |
+| M3.4 楼层 AO | 与 `LightMapper` / `GTAONode` 目标不同 | 保留轻量近似，完整烘焙用内置 |
+| M3.5 光照跟随大气 | 否 | 光源用 `SunLight` / `LightProbe`，颜色和强度由我们的大气计算 |
+| M3.6 合批与样式池 | r186 的 `BatchedMesh` 在 WebGPU 上不省 draw | r186 用 `InstancedMesh`；`BatchedMesh` 依赖 M0 |
+| M3.7 冒名顶替 | three 没有 | 保留 |
+| M3.9 OIT / 阴影 | 否，直接用内置 | 阴影先评估 `SunLight` / `TileShadowNode`，ECEF 范围适配仍需移植 |
+| M4 数据与分析 | 否 | r187 起结构体存储缓冲统一按数组访问（`element(0)`），写计算节点时注意 |
+| M5 工具 | 与 Inspector 部分重叠 | 基于 Inspector 扩展 |
+
+### 8.3 地球瓦片调度的后续（接 [tile-loading.md](tile-loading.md)）
+
+本次已落地：选择记忆、不丢细节守卫、象限填充、兄弟瓦片预建、本地构网独立并发额度、取消即释放、地平线雾化 SSE、新上屏瓦片的淡入规则，以及下面第 1、3 条（地形渐变、按服务器限流）。后续可选：
+
+1. ~~**临时网格换精确网格时的几何渐变**~~：已落地，见 tile-loading.md §2"地形渐变"。除临时→精确外，父子层级切换也做渐变。
+2. **放大时也用象限填充**：目前只在"上一帧已细化"时使用。放大时也用的话，部分子瓦片就绪就能细化，影像请求会更早发出。
+3. ~~**按服务器限流**~~：已落地（`imagery/RequestScheduler.ts`，见 tile-loading.md §3）。目前靠预设声明 `maxRequestsPerHost`；跨域请求拿不到 `nextHopProtocol`，无法自动探测 HTTP 版本。地形 Worker 的下载还没有接入。
+4. **上传预算改按字节和 GPU 时间**：现在按个数和 CPU 时间计。
+5. **瓦片材质改 `NodeMaterialInstance`**（M0），降低新瓦片首帧的节点构建开销。
+6. **带注记的栅格底图（如 ArcGIS 地形图）**（暂缓：底图带不带注记都会用到，单独的注记图层同样按层级出图、切换时一样会移动，修复纹理槽合并后切换已是一次干净的淡入）：放大时祖先影像被放大 2–4 倍，注记字号和位置随层级整体变化，即使淡入也像"跳一下"。根本办法是底图用无注记版本（ArcGIS 影像、Carto `*_nolabels`），注记单独作为屏幕空间矢量注记（`LabelManager`）或叠加层。
+7. ~~**预取下一级影像**~~：已落地（只进 HTTP 缓存，见 tile-loading.md §3.2）。叠加层尚未预取。
+8. **淡入期间由糊到清**：新影像淡入时从较高的 mip 偏置逐步降到 0（TSL `texture().bias()`），减少两张不同层级画面叠加的重影感，注记尤其明显。
+9. **缩小时的淡出**：父瓦片替换子瓦片目前直接切换（Cesium 同样如此）。可以让子瓦片在父瓦片之上短暂淡出，需要处理深度与透明排序。
+10. **持久缓存**：ArcGIS 瓦片 `max-age=86400`，一天内浏览器缓存有效；跨天或离线需要 Cache API / IndexedDB 缓存压缩字节。
+11. **地形 Worker 的下载接入按域名限流**（见第 3 条）。
