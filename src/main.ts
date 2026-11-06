@@ -89,7 +89,10 @@ async function main(): Promise<void> {
   enableFileDrop(app, (files) => {
     const buildings = files.filter((f) => /\.building\.json$/i.test(f.name));
     for (const f of buildings) void panel.indoorPanel.loadFile(f);
-    const rest = files.filter((f) => !buildings.includes(f));
+    // *.points.json (or .points.geojson) become point marker layers, other GeoJSON draped vectors.
+    const points = files.filter((f) => /\.points\.(geo)?json$/i.test(f.name));
+    if (points.length) void panel.pointPanel.loadFiles(points);
+    const rest = files.filter((f) => !buildings.includes(f) && !points.includes(f));
     if (rest.length) void panel.vectorPanel.loadFiles(rest);
   });
   window.addEventListener('keydown', (e) => {
@@ -101,6 +104,8 @@ async function main(): Promise<void> {
 
   // ?geojson=<url> loads a GeoJSON layer on startup (repeatable).
   for (const url of params.getAll('geojson')) panel.vectorPanel.load({ url }, !location.hash);
+  // ?points=<url> loads a point marker layer (GeoJSON points or records with lon / lat; repeatable).
+  for (const url of params.getAll('points')) panel.pointPanel.load({ url }, !location.hash);
 
   // ?demo loads the procedural office building; ?building=<url> a building document.
   if (params.has('demo')) panel.indoorPanel.loadDemo();
@@ -126,7 +131,7 @@ function isTyping(e: KeyboardEvent): boolean {
 
 /** Drag GeoJSON (or *.building.json) files anywhere onto the page to load them. */
 function enableFileDrop(app: HTMLElement, onFiles: (files: File[]) => void): void {
-  const overlay = h('div', { class: 'drop-overlay', hidden: true }, h('div', {}, '释放以加载 GeoJSON / building.json 文件'));
+  const overlay = h('div', { class: 'drop-overlay', hidden: true }, h('div', {}, '释放以加载 GeoJSON / points.json / building.json 文件'));
   app.append(overlay);
   let depth = 0;
   const hasFiles = (e: DragEvent) => !!e.dataTransfer && [...e.dataTransfer.types].includes('Files');

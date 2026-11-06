@@ -18,6 +18,7 @@ import { h, section, slider, toggle } from './dom';
 import { IndoorPanel } from './IndoorPanel';
 import { BOOKMARKS, TILESET_PRESETS, type Bookmark } from './presets';
 import { OverlayPanel } from './OverlayPanel';
+import { PointPanel } from './PointPanel';
 import { saveSettings, type Settings, type TerrainChoice } from './settings';
 import { VectorPanel } from './VectorPanel';
 
@@ -65,6 +66,7 @@ const TERRAIN_CHOICES: { id: TerrainChoice; name: string }[] = [
 export class ControlPanel {
   readonly root: HTMLElement;
   readonly vectorPanel: VectorPanel;
+  readonly pointPanel: PointPanel;
   readonly indoorPanel: IndoorPanel;
   private readonly layerList = h('div', { class: 'layer-list' });
   private readonly message = h('div', { class: 'panel-message', role: 'status' });
@@ -75,6 +77,7 @@ export class ControlPanel {
   ) {
     const collapse = h('button', { class: 'panel-toggle', title: '收起 / 展开面板', 'aria-label': '收起或展开面板' }, '☰');
     this.vectorPanel = new VectorPanel(viewer, (text, kind) => this.notify(text, kind));
+    this.pointPanel = new PointPanel(viewer, (text, kind) => this.notify(text, kind));
     this.indoorPanel = new IndoorPanel(viewer, (text, kind) => this.notify(text, kind));
     const body = h(
       'div',
@@ -82,6 +85,7 @@ export class ControlPanel {
       this.basemapSection(),
       this.terrainSection(),
       this.vectorPanel.root,
+      this.pointPanel.root,
       this.indoorPanel.root,
       this.sceneSection(),
       this.tilesSection(),

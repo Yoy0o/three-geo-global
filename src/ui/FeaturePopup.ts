@@ -1,6 +1,8 @@
 import { Vector3 } from 'three';
 import { formatDegrees, formatDistance } from '../core/math';
 import type { BimEntity } from '../indoor/BimEntity';
+import type { PointLayer } from '../markers/PointLayer';
+import { defaultTitle, type PointRecord } from '../markers/points';
 import type { FeaturePick, GeoViewer } from '../viewer/GeoViewer';
 import { h } from './dom';
 
@@ -31,6 +33,8 @@ export class FeaturePopup {
   readonly root: HTMLElement;
   private requestId = 0;
   private entity: BimEntity | null = null;
+  /** Layer whose selected point the popup shows. */
+  private pointLayer: PointLayer | null = null;
 
   constructor(private readonly viewer: GeoViewer) {
     this.root = h('div', { class: 'feature-popup', hidden: true, role: 'dialog', 'aria-label': '属性' });
@@ -46,6 +50,27 @@ export class FeaturePopup {
       const hl = viewer.vectors.highlighted;
       if (hl && !layers.some((l) => l.id === hl.layerId)) this.close();
     });
+    viewer.events.on('point-click', ({ point, layer, event }) => this.showPoint(point, layer, event.clientX, event.clientY));
+    viewer.events.on('points-changed', (layers) => {
+      if (this.pointLayer && !layers.includes(this.pointLayer)) this.close();
+    });
+  }
+
+  private showPoint(point: PointRecord, layer: PointLayer, x: number, y: number): void {
+    this.requestId++;
+    this.viewer.highlightFeature(null);
+    if (this.entity) {
+      this.entity = null;
+      this.viewer.indoor.select(null);
+    }
+    if (this.pointLayer && this.pointLayer !== layer) this.pointLayer.select(null);
+    this.pointLayer = layer;
+    const fly = h('button', { class: 'btn ghost small' }, '聚焦');
+    fly.addEventListener('click', () => void this.viewer.flyToBBox([point.longitude, point.latitude, point.longitude, point.latitude]));
+    const { style: _style, ...properties } = point.properties;
+    const where = `${point.longitude.toFixed(5)}°E ${point.latitude.toFixed(5)}°N${point.height !== null ? ` · ${formatDistance(point.height)}` : ''}`;
+    this.render(defaultTitle(point), `${layer.name} · 点位 ${point.id}`, properties, where, fly);
+    this.place(x, y);
   }
 
   get isOpen(): boolean {
@@ -141,6 +166,8 @@ export class FeaturePopup {
     this.requestId++;
     if (!this.root.hidden) this.root.hidden = true;
     this.viewer.highlightFeature(null);
+    this.pointLayer?.select(null);
+    this.pointLayer = null;
     if (this.entity) {
       this.entity = null;
       this.viewer.indoor.select(null);

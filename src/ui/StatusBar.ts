@@ -91,6 +91,9 @@ export class StatusBar {
       busy ||= (ts.downloading ?? 0) + (ts.parsing ?? 0) > 0;
       tilesText += ` · 3D ${ts.visible ?? 0}`;
     }
+    // HTML markers shown / registered, with their per-frame CPU time (docs/agents/markers.md §5).
+    const m = v.markers.stats;
+    if (m.total > 0) tilesText += ` · 顶牌 ${m.shown} / ${m.total} (${m.ms.toFixed(1)} ms)`;
     this.tiles.textContent = tilesText;
     this.spinner.classList.toggle('active', busy);
 
