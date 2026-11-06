@@ -1,4 +1,20 @@
+/**
+ * HTML markers / top cards (顶牌) anchored to world positions: projection in
+ * float64 each frame, culling (behind the camera, horizon, viewport, distance
+ * range) and screen-space decluttering.
+ *
+ * Built for thousands of markers (see docs/agents/markers.md §5):
+ * - Decluttering uses a uniform grid (`CollisionGrid`), O(n) per frame.
+ * - Styles are written only when they change (transform rounded to 0.1 px,
+ *   z-index, display), so a still camera causes no style recalculation and a
+ *   moving one only touches the markers on screen.
+ * - New or resized elements are measured together in one layout.
+ * - Above `DENSE_ON` shown markers the layer gets the `dense` class, which
+ *   drops per-element blur filters (`backdrop-filter` re-blurs the WebGPU
+ *   canvas under every label on every frame).
+ */
 import { Matrix4, Vector3, type PerspectiveCamera } from 'three';
+import { CollisionGrid } from '../core/CollisionGrid';
 import { isScaledSpacePointVisible, WGS84_A, WGS84_B } from '../core/geodesy';
 
 export interface MarkerOptions {
@@ -33,6 +49,34 @@ export interface MarkerOptions {
   userData?: Record<string, unknown>;
 }
 
+/** Per-frame counters (`viewer.markers.stats`). */
+export interface MarkerStats {
+  /** Registered markers. */
+  total: number;
+  /** Passed culling this frame. */
+  candidates: number;
+  /** Hidden by decluttering this frame. */
+  decluttered: number;
+  /** Shown this frame. */
+  shown: number;
+  /** CPU time of the last `update`, ms. */
+  ms: number;
+}
+
+/** Shown-marker counts that switch the layer's `dense` class on / off (hysteresis). */
+const DENSE_ON = 80;
+const DENSE_OFF = 60;
+/**
+ * Collision placement runs at most this often (ms), like Mapbox GL's symbol placement;
+ * in between, markers keep their last decision and only move. Placing every frame makes
+ * labels blink while zooming and restyles hundreds of elements per frame.
+ */
+const PLACEMENT_INTERVAL = 150;
+/** Sooner when markers new in view are waiting for a decision (they stay hidden until then). */
+const PENDING_INTERVAL = 50;
+/** Padding around placed markers in the collision test, CSS px. */
+const GAP = 2;
+
 const _vp = new Matrix4();
 const _cam = new Vector3();
 
@@ -50,6 +94,18 @@ export class Marker {
   private readonly wrapper: HTMLElement;
   private readonly onClick: (e: MouseEvent) => void;
   private readonly onDoubleClick: (e: MouseEvent) => void;
+  // Last written style values (write-on-change).
+  private lastX = Number.NaN;
+  private lastY = Number.NaN;
+  private lastScale = 1;
+  private lastZ = Number.NaN;
+  private originSet = false;
+  /** @internal Per-frame values used by `MarkerManager.update`. */
+  scale = 1;
+  z = 0;
+  priority = 0;
+  /** @internal Last collision decision: 0 = none yet, 1 = placed, 2 = decluttered. */
+  placement: 0 | 1 | 2 = 0;
 
   constructor(
     readonly options: MarkerOptions,
@@ -78,19 +134,38 @@ export class Marker {
     this.width = -1;
   }
 
+  /** @internal Whether the element size is unknown (new, or changed with `invalidateSize`). */
+  get needsMeasure(): boolean {
+    return this.width < 0;
+  }
+
+  /**
+   * @internal Measures many markers with a single layout: show the hidden
+   * ones, read all sizes, then hide them again. Measuring one by one would
+   * force one synchronous layout per marker (seconds for thousands of points).
+   */
+  static measureAll(markers: readonly Marker[]): void {
+    const unhidden: Marker[] = [];
+    for (const m of markers) {
+      if (m.wrapper.style.display === 'none') {
+        m.wrapper.style.display = '';
+        unhidden.push(m);
+      }
+    }
+    for (const m of markers) {
+      m.width = m.element.offsetWidth;
+      m.height = m.element.offsetHeight;
+    }
+    for (const m of unhidden) m.wrapper.style.display = 'none';
+  }
+
   remove(): void {
     this.manager.remove(this);
   }
 
   /** @internal Element size in CSS pixels (measured once, or after `invalidateSize`). */
   measure(): [number, number] {
-    if (this.width < 0) {
-      const hidden = this.wrapper.style.display === 'none';
-      if (hidden) this.wrapper.style.display = '';
-      this.width = this.element.offsetWidth;
-      this.height = this.element.offsetHeight;
-      if (hidden) this.wrapper.style.display = 'none';
-    }
+    if (this.width < 0) Marker.measureAll([this]);
     return [this.width, this.height];
   }
 
@@ -104,20 +179,40 @@ export class Marker {
     return [ax - px * w * scale, ay - py * h * scale, ax + (1 - px) * w * scale, ay + (1 - py) * h * scale];
   }
 
-  /** @internal */
+  /** @internal Places the element with its anchor at (x, y); writes only what changed. */
   place(x: number, y: number, scale: number, z: number): void {
     this.measure();
     const [px, py] = this.options.pivot ?? [0.5, 1];
     const [ox, oy] = this.options.offsetPx ?? [0, 0];
-    const tx = x - px * this.width + ox;
-    const ty = y - py * this.height + oy;
-    this.wrapper.style.transformOrigin = `${px * 100}% ${py * 100}%`;
-    this.wrapper.style.transform = `translate3d(${tx.toFixed(1)}px, ${ty.toFixed(1)}px, 0)${scale !== 1 ? ` scale(${scale.toFixed(3)})` : ''}`;
-    this.wrapper.style.zIndex = String(z);
+    // Rounded to 0.1 px: sub-pixel jitter of a still camera writes nothing.
+    const tx = Math.round((x - px * this.width + ox) * 10) / 10;
+    const ty = Math.round((y - py * this.height + oy) * 10) / 10;
+    const s = Math.round(scale * 1000) / 1000;
+    const style = this.wrapper.style;
+    if (tx !== this.lastX || ty !== this.lastY || s !== this.lastScale) {
+      if (!this.originSet) {
+        style.transformOrigin = `${px * 100}% ${py * 100}%`;
+        this.originSet = true;
+      }
+      style.transform = `translate3d(${tx}px, ${ty}px, 0)${s !== 1 ? ` scale(${s})` : ''}`;
+      this.lastX = tx;
+      this.lastY = ty;
+      this.lastScale = s;
+    }
+    if (z !== this.lastZ) {
+      style.zIndex = String(z);
+      this.lastZ = z;
+    }
     if (!this.shown) {
-      this.wrapper.style.display = '';
+      style.display = '';
       this.shown = true;
     }
+  }
+
+  /** @internal Hidden by culling: the next placement decides again whether it fits. */
+  cull(): void {
+    this.hide();
+    this.placement = 0;
   }
 
   /** @internal */
@@ -144,7 +239,15 @@ export class Marker {
  */
 export class MarkerManager {
   readonly root: HTMLElement;
+  readonly stats: MarkerStats = { total: 0, candidates: 0, decluttered: 0, shown: 0, ms: 0 };
   private readonly markers = new Set<Marker>();
+  private readonly candidates: Marker[] = [];
+  private readonly unmeasured: Marker[] = [];
+  private readonly grid = new CollisionGrid(64);
+  private dense = false;
+  private lastPlacement = -Infinity;
+  private placementRequested = true;
+  private pending = false;
 
   /**
    * @param eventTarget Element that receives wheel events over interactive
@@ -175,6 +278,7 @@ export class MarkerManager {
   add(options: MarkerOptions): Marker {
     const marker = new Marker(options, this);
     this.markers.add(marker);
+    this.placementRequested = true;
     this.root.append(marker.root);
     return marker;
   }
@@ -190,7 +294,15 @@ export class MarkerManager {
 
   /** Positions all markers for this frame. */
   update(camera: PerspectiveCamera, width: number, height: number): void {
-    if (this.markers.size === 0) return;
+    const t0 = performance.now();
+    const stats = this.stats;
+    stats.total = this.markers.size;
+    if (this.markers.size === 0) {
+      stats.candidates = stats.decluttered = stats.shown = 0;
+      stats.ms = 0;
+      this.setDense(false);
+      return;
+    }
     camera.updateMatrixWorld();
     _cam.setFromMatrixPosition(camera.matrixWorld);
     _vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
@@ -198,33 +310,34 @@ export class MarkerManager {
     const csx = _cam.x / WGS84_A;
     const csy = _cam.y / WGS84_A;
     const csz = _cam.z / WGS84_B;
-    const candidates: { m: Marker; scale: number; z: number; priority: number }[] = [];
+    const candidates = this.candidates;
+    candidates.length = 0;
     for (const m of this.markers) {
       const o = m.options;
       const visible = typeof o.visible === 'function' ? o.visible() : o.visible !== false;
       const p = visible ? (typeof o.position === 'function' ? o.position() : o.position) : null;
       if (!p) {
-        m.hide();
+        m.cull();
         continue;
       }
       const dist = p.distanceTo(_cam);
       if ((o.maxDistance !== undefined && dist > o.maxDistance) || (o.minDistance !== undefined && dist < o.minDistance)) {
-        m.hide();
+        m.cull();
         continue;
       }
       if (o.horizonCulling !== false && !isScaledSpacePointVisible(p.x / WGS84_A, p.y / WGS84_A, p.z / WGS84_B, csx, csy, csz)) {
-        m.hide();
+        m.cull();
         continue;
       }
       const w = e[3] * p.x + e[7] * p.y + e[11] * p.z + e[15];
       if (w <= 0) {
-        m.hide();
+        m.cull();
         continue;
       }
       const nx = (e[0] * p.x + e[4] * p.y + e[8] * p.z + e[12]) / w;
       const ny = (e[1] * p.x + e[5] * p.y + e[9] * p.z + e[13]) / w;
       if (nx < -1.2 || nx > 1.2 || ny < -1.2 || ny > 1.2) {
-        m.hide();
+        m.cull();
         continue;
       }
       let scale = 1;
@@ -236,30 +349,77 @@ export class MarkerManager {
       m.screenX = (nx + 1) * 0.5 * width;
       m.screenY = (1 - ny) * 0.5 * height;
       m.distance = dist;
-      // Nearer markers on top: z-index band per option, ordered by distance inside it.
-      const z = (o.zIndex ?? 0) * 100_000 + Math.max(0, 99_999 - Math.round(Math.log2(1 + dist) * 3000));
+      m.scale = scale;
+      // z-index band per option. Decluttered markers never overlap once placed, so only
+      // obstacles are ordered by distance (nearer on top); a distance-based z-index on every
+      // marker would restyle all of them on every frame of a zoom.
+      m.z = (o.zIndex ?? 0) * 100_000 + (o.declutter === true ? 0 : Math.max(1, 99_999 - Math.round(Math.log2(1 + dist) * 300)));
+      // Obstacles (not decluttered) sort before every decluttered marker.
       const priority = typeof o.priority === 'function' ? o.priority() : (o.priority ?? 0);
-      candidates.push({ m, scale, z, priority });
+      m.priority = o.declutter === true ? priority : priority + 1e9;
+      candidates.push(m);
     }
 
-    // Obstacles (non-decluttered) first, then by priority, then nearest first; a decluttered
-    // marker is hidden when its box overlaps one already placed.
-    candidates.sort(
-      (a, b) =>
-        Number(a.m.options.declutter === true) - Number(b.m.options.declutter === true) ||
-        b.priority - a.priority ||
-        a.m.distance - b.m.distance,
-    );
-    const placed: [number, number, number, number][] = [];
-    for (const c of candidates) {
-      const r = c.m.rect(c.m.screenX, c.m.screenY, c.scale);
-      if (c.m.options.declutter && placed.some((p) => r[0] < p[2] && r[2] > p[0] && r[1] < p[3] && r[3] > p[1])) {
-        c.m.hide();
-        continue;
+    // New or changed elements are measured together (one layout instead of one per marker).
+    const unmeasured = this.unmeasured;
+    unmeasured.length = 0;
+    for (const m of candidates) if (m.needsMeasure) unmeasured.push(m);
+    if (unmeasured.length > 0) Marker.measureAll(unmeasured);
+
+    let shown = 0;
+    let decluttered = 0;
+    const elapsed = t0 - this.lastPlacement;
+    if (this.placementRequested || elapsed >= PLACEMENT_INTERVAL || (this.pending && elapsed >= PENDING_INTERVAL)) {
+      this.placementRequested = false;
+      this.pending = false;
+      this.lastPlacement = t0;
+      // Obstacles first, then by priority, then nearest first; a decluttered marker is hidden
+      // when its box overlaps one already placed.
+      candidates.sort((a, b) => b.priority - a.priority || a.distance - b.distance);
+      const grid = this.grid;
+      grid.reset(width, height);
+      for (const m of candidates) {
+        const [x0, y0, x1, y1] = m.rect(m.screenX, m.screenY, m.scale);
+        if (m.options.declutter && grid.hits(x0, y0, x1, y1)) {
+          m.placement = 2;
+          m.hide();
+          decluttered++;
+          continue;
+        }
+        grid.insert(x0 - GAP, y0 - GAP, x1 + GAP, y1 + GAP);
+        m.placement = 1;
+        m.place(m.screenX, m.screenY, m.scale, m.z);
+        shown++;
       }
-      placed.push([r[0] - 2, r[1] - 2, r[2] + 2, r[3] + 2]);
-      c.m.place(c.m.screenX, c.m.screenY, c.scale, c.z);
+    } else {
+      // Between placements: keep decisions; markers new in view wait for the next placement.
+      for (const m of candidates) {
+        if (m.options.declutter && m.placement !== 1) {
+          if (m.placement === 0) this.pending = true;
+          m.hide();
+          decluttered++;
+          continue;
+        }
+        m.place(m.screenX, m.screenY, m.scale, m.z);
+        shown++;
+      }
     }
+    this.setDense(this.dense ? shown > DENSE_OFF : shown > DENSE_ON);
+    stats.candidates = candidates.length;
+    stats.decluttered = decluttered;
+    stats.shown = shown;
+    stats.ms = performance.now() - t0;
+  }
+
+  /** Runs the collision placement on the next update (e.g. after a selection changes priorities). */
+  requestPlacement(): void {
+    this.placementRequested = true;
+  }
+
+  private setDense(dense: boolean): void {
+    if (dense === this.dense) return;
+    this.dense = dense;
+    this.root.classList.toggle('dense', dense);
   }
 
   dispose(): void {

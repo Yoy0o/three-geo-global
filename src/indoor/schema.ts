@@ -18,6 +18,7 @@
  * the rest is static geometry that is drawn but not individually managed
  * (ThingJS "Misc"). See docs/agents/indoor-bim.md.
  */
+import type { MarkerStyleName } from '../markers/points';
 
 export const BUILDING_FORMAT = 'three-geo-building';
 export const BUILDING_FORMAT_VERSION = '1.0';
@@ -66,8 +67,12 @@ export interface LabelDef {
   title?: string;
   subtitle?: string;
   mode?: LabelMode;
-  /** 'card': speech bubble with leader line; 'pin': icon + text; 'tag': compact pill. */
-  style?: 'card' | 'pin' | 'tag';
+  /**
+   * 'card': speech bubble with leader line; 'pin': icon + text; 'tag': compact pill;
+   * or any point marker style ('pulse' for alarms, 'badge', 'poi', 'beacon', 'label'),
+   * see docs/agents/markers.md.
+   */
+  style?: MarkerStyleName;
   /** Accent color (CSS). */
   color?: string;
   /** Short text or emoji shown before the title. */

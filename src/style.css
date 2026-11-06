@@ -791,6 +791,23 @@ select.field-select {
   left: 0;
   will-change: transform;
   pointer-events: none;
+  /* A marker's layout never affects the others (cheaper measuring and restyling). */
+  contain: layout style;
+}
+
+/*
+ * Many markers on screen (MarkerManager DENSE_ON): drop per-element filters. backdrop-filter
+ * re-blurs the WebGPU canvas under every label on every frame; drop-shadow makes each newly
+ * shown marker expensive to rasterize.
+ */
+.marker-layer.dense .tg-card {
+  filter: none;
+}
+
+.marker-layer.dense .tg-body {
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  background: rgba(10, 16, 28, 0.9);
 }
 
 .marker.interactive > * {
@@ -843,7 +860,7 @@ select.field-select {
   font-size: 11px;
 }
 
-.tg-badge {
+.tg-status {
   font-style: normal;
   font-size: 10.5px;
   font-weight: 700;
@@ -900,6 +917,198 @@ select.field-select {
 .tg-tag .tg-text strong {
   font-size: 11.5px;
   font-weight: 500;
+}
+
+/* Point marker styles (点位). Each element ends at its anchor: pin tip, dot / disc / ring center. */
+
+.tg-poi .tg-body,
+.tg-pulse .tg-body,
+.tg-beacon .tg-body,
+.tg-badge .tg-body {
+  padding: 2px 8px;
+  border-radius: 6px;
+  border-left-width: 1px;
+  background: rgba(10, 16, 28, 0.86);
+  /* Point styles come in bulk: no backdrop blur (see .marker-layer.dense). */
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.tg-poi .tg-text strong,
+.tg-pulse .tg-text strong,
+.tg-beacon .tg-text strong,
+.tg-badge .tg-text strong {
+  font-size: 11.5px;
+  font-weight: 500;
+}
+
+/* Teardrop map pin; its tip is the bottom of the element. */
+.tg-drop {
+  position: relative;
+  display: block;
+  width: 24px;
+  height: 32px;
+  margin-top: 3px;
+}
+
+.tg-drop svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: var(--accent);
+  stroke: rgba(4, 10, 20, 0.55);
+  stroke-width: 1;
+}
+
+.tg-drop b {
+  position: absolute;
+  top: 3px;
+  left: 0;
+  width: 24px;
+  height: 18px;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 18px;
+  text-align: center;
+  color: #04101f;
+}
+
+/* Breathing dot with two expanding rings; the element ends at the dot's center. */
+.tg-pulse-dot {
+  position: relative;
+  display: block;
+  width: 12px;
+  height: 12px;
+  margin: 6px 0 -6px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+
+.tg-pulse-dot b {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  animation: tg-ripple 2s ease-out infinite;
+}
+
+.tg-pulse-dot b + b {
+  animation-delay: 1s;
+}
+
+@keyframes tg-ripple {
+  from {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  to {
+    transform: scale(4.2);
+    opacity: 0;
+  }
+}
+
+/* Light pillar on a ground ring; the element ends at the ring's center. */
+.tg-beam {
+  display: block;
+  width: 3px;
+  height: 56px;
+  margin-top: 2px;
+  border-radius: 2px;
+  background: linear-gradient(to top, var(--accent), color-mix(in srgb, var(--accent) 0%, transparent));
+  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 70%, transparent);
+}
+
+.tg-ring {
+  display: block;
+  width: 20px;
+  height: 8px;
+  margin: -4px 0 -4px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  box-shadow: 0 0 8px var(--accent);
+}
+
+/* Round disc with an icon or a number; the element ends at the disc's center. */
+.tg-disc {
+  --size: 28px;
+  display: grid;
+  place-items: center;
+  width: var(--size);
+  height: var(--size);
+  margin: 4px 0 calc(var(--size) / -2);
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  color: #04101f;
+  font-style: normal;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.tg-cluster .tg-disc {
+  width: var(--size);
+  height: var(--size);
+  margin: 0 0 calc(var(--size) / -2);
+  border: none;
+  background: color-mix(in srgb, var(--accent) 88%, #000);
+  color: #fff;
+  font-size: 12px;
+  box-shadow:
+    0 0 0 4px color-mix(in srgb, var(--accent) 38%, transparent),
+    0 0 0 8px color-mix(in srgb, var(--accent) 16%, transparent);
+}
+
+/* Text with a halo over a small dot; the element ends at the dot's center. */
+.tg-label {
+  filter: none;
+}
+
+.tg-label-text {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: #fff;
+  text-shadow:
+    0 0 3px rgba(0, 0, 0, 0.95),
+    0 0 2px rgba(0, 0, 0, 0.95),
+    0 1px 3px rgba(0, 0, 0, 0.8);
+}
+
+.tg-label .tg-dot {
+  width: 6px;
+  height: 6px;
+  margin: 3px 0 -3px;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55);
+}
+
+/* Interaction feedback for clickable markers. */
+.marker.interactive .tg-card {
+  transform-origin: 50% 100%;
+  transition: transform 0.12s ease-out;
+}
+
+.marker.interactive:hover .tg-card {
+  transform: scale(1.08);
+}
+
+.tg-card.selected .tg-drop svg,
+.tg-card.selected .tg-disc,
+.tg-card.selected .tg-pulse-dot,
+.tg-card.selected .tg-ring {
+  filter: drop-shadow(0 0 6px #fff);
+}
+
+.tg-card.selected .tg-body {
+  border-color: #fff;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tg-pulse-dot b {
+    animation: none;
+    opacity: 0;
+  }
 }
 
 /* ---------------------------------------------------------------- indoor level bar / floor switcher */
