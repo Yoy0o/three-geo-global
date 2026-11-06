@@ -28,6 +28,7 @@ import {
   viewportSize,
 } from 'three/tsl';
 import type { TSLNode } from '../atmosphere/AtmosphereNodes';
+import { CollisionGrid } from '../core/CollisionGrid';
 import type { Ellipsoid } from '../core/Ellipsoid';
 import { isScaledSpacePointVisible, WGS84_A, WGS84_B } from '../core/geodesy';
 import type { FeatureKind, LabelCandidate, LabelStyle } from './types';
@@ -244,44 +245,6 @@ class AtlasPage {
     this.mesh.geometry.dispose();
     this.material.dispose();
     this.texture.dispose();
-  }
-}
-
-/** Uniform screen grid for label collision tests. */
-class CollisionGrid {
-  private cells: number[][] = [];
-  private rects: number[] = [];
-  private cols = 0;
-  private rows = 0;
-  private readonly size = 64;
-
-  reset(width: number, height: number): void {
-    this.cols = Math.max(1, Math.ceil(width / this.size));
-    this.rows = Math.max(1, Math.ceil(height / this.size));
-    const n = this.cols * this.rows;
-    if (this.cells.length !== n) this.cells = Array.from({ length: n }, () => []);
-    else for (const c of this.cells) c.length = 0;
-    this.rects.length = 0;
-  }
-
-  /** Inserts the rect unless it overlaps an existing one. */
-  tryInsert(x0: number, y0: number, x1: number, y1: number): boolean {
-    const cx0 = Math.max(0, Math.floor(x0 / this.size));
-    const cy0 = Math.max(0, Math.floor(y0 / this.size));
-    const cx1 = Math.min(this.cols - 1, Math.floor(x1 / this.size));
-    const cy1 = Math.min(this.rows - 1, Math.floor(y1 / this.size));
-    const r = this.rects;
-    for (let cy = cy0; cy <= cy1; cy++) {
-      for (let cx = cx0; cx <= cx1; cx++) {
-        for (const i of this.cells[cy * this.cols + cx]) {
-          if (x0 < r[i + 2] && x1 > r[i] && y0 < r[i + 3] && y1 > r[i + 1]) return false;
-        }
-      }
-    }
-    const idx = r.length;
-    r.push(x0, y0, x1, y1);
-    for (let cy = cy0; cy <= cy1; cy++) for (let cx = cx0; cx <= cx1; cx++) this.cells[cy * this.cols + cx].push(idx);
-    return true;
   }
 }
 
