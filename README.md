@@ -43,6 +43,7 @@ npm test           # 核心数学单元测试（vitest）
 | `?noterrain` | 启动时关闭地形（地形源在面板里切换，含 Mapbox / MapTiler / Cesium World Terrain / quantized-mesh） |
 | `?tileset=<url>` | 启动后加载一个 3D Tiles（tileset.json） |
 | `?geojson=<url>` | 启动后加载 GeoJSON（可重复多次） |
+| `?points=<url>` | 启动后加载点位标注：GeoJSON 点要素或带 lon / lat 字段的记录数组（可重复多次） |
 | `?demo` | 加载程序生成的示例办公楼（5 层，房间 / 设备 / 传感器 / 机房告警）并进入 |
 | `?building=<url>` | 加载 `three-geo-building` 格式的建筑文档（格式见 [docs/agents/indoor-bim.md](docs/agents/indoor-bim.md)） |
 | `#lon,lat,height,heading,pitch` | 相机位置（会随浏览自动更新，可直接分享链接） |
@@ -110,6 +111,7 @@ npm test           # 核心数学单元测试（vitest）
 
 **交互、顶牌与相机（参考 ThingJS，[对照表](docs/agents/thingjs-reference.md)、[运行时源码分析](docs/agents/thingjs-runtime-analysis.md)）**
 - 统一事件：`viewer.interaction.on('click' | 'dblclick' | 'rightclick' | 'mousemove' | 'mouseenter' | 'mouseleave', fn, { selector, tag })`，选择器冒泡、标签批量注销、`preventDefault()` 屏蔽默认行为
+- 点位标注（[规范](docs/agents/markers.md)）：`viewer.addPoints()` 加载 GeoJSON 点或记录数组；8 种样式（水滴图钉、呼吸点、徽章、光柱、文字等）；按属性的样式规则与文本模板；自动贴地；屏幕空间聚合（点击放大）；点击查看属性
 - HTML 顶牌：float64 投影、地平线 / 距离 / 视口裁剪、优先级避让；数据驱动显示模式（常显 / 进入层级后 / 悬停 / 点击）；卡片 / 图钉 / 标签三种样式
 - 自研相机控制器（[规范](docs/agents/camera-controller.md)）：零 roll、俯视不翻转的航向算法、保持姿态的光标缩放、右键航向 / 俯仰、俯仰范围、手势开关、环绕巡航、惯性、触屏、键盘、按可靠地形防入地
 - 相机 API：`flyTo`、`flyToTarget({ target, heading, pitch, range })`、`flyToSphere`、`flyToEntity`、`startAutoOrbit`、`resetNorth`；大圆弧线飞行
@@ -152,7 +154,7 @@ src/
 ├─ tiles3d/     3D Tiles 图层封装、节点材质与 WebGPU 渐显
 ├─ vector/      GeoJSON 图层、矢量 Worker、注记管理、几何算法
 ├─ indoor/      BIM 文档格式、实体与选择器、建筑构建、层级导航、示例建筑
-├─ markers/     HTML 顶牌管理与卡片模板
+├─ markers/     HTML 顶牌管理、样式模板、点位图层（解析 / 规则 / 聚合）
 ├─ viewer/      GeoViewer、相机控制器、相机数学、飞行动画、交互事件
 └─ ui/          控制面板、室内面板、层级条、状态栏、属性弹窗、预设
 ```
@@ -224,7 +226,7 @@ viewer.interaction.on('click', (e) => console.log(e.object?.properties), { selec
 
 **近期（v0.2）——数据与可用性**
 - 地形与 3D Tiles 统一高程查询（贴地、防入地都考虑 3D Tiles 表面）；瓦片边界法线拼接
-- 矢量进阶：MVT 矢量瓦片、面拉伸（建筑白模）、沿线注记、图标符号、点聚合
+- 矢量进阶：MVT 矢量瓦片、面拉伸（建筑白模）、沿线注记（点位标注与聚合已完成）
 - 3D Tiles 要素拾取与属性查询（EXT_mesh_features / batch table），高亮；接入统一事件
 - 临时地形到精确地形的几何形变过渡；Worker 间共享高程缓存
 - 室内：IFC 直读（web-ifc）与按楼层流式加载、剖切面 / 剖切盒、室内导航、设备实例化渲染、实体描边

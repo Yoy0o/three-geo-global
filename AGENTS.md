@@ -7,6 +7,7 @@
 | 相机控制器（手势、不变量、数学） | [docs/agents/camera-controller.md](docs/agents/camera-controller.md) |
 | 瓦片加载（底图 / 地形 / 3D Tiles） | [docs/agents/tile-loading.md](docs/agents/tile-loading.md) |
 | 室内与 BIM 模型定义、层级导航 | [docs/agents/indoor-bim.md](docs/agents/indoor-bim.md) |
+| 顶牌样式与点位标注（数据格式、样式规则、聚合） | [docs/agents/markers.md](docs/agents/markers.md) |
 | 可借鉴与复用路线图（分阶段落地计划，开始新功能前先看） | [docs/agents/roadmap.md](docs/agents/roadmap.md) |
 | ThingJS 示例分析与能力对照 | [docs/agents/thingjs-reference.md](docs/agents/thingjs-reference.md) |
 | ThingJS 运行时源码分析、可借鉴的实现与落地清单（改层级、拾取、事件、样式前先看） | [docs/agents/thingjs-runtime-analysis.md](docs/agents/thingjs-runtime-analysis.md) |
@@ -25,7 +26,7 @@
   npm run build      # 类型检查 + 生产构建
   ```
 
-- 常用 URL 参数：`?webgl` `?imagery=osm` `?noterrain` `?tileset=<url>` `?geojson=<url>` `?demo`（示例办公楼）`?building=<url>`，以及 `#lon,lat,height,heading,pitch`。
+- 常用 URL 参数：`?webgl` `?imagery=osm` `?noterrain` `?tileset=<url>` `?geojson=<url>` `?points=<url>`（点位标注）`?demo`（示例办公楼）`?building=<url>`，以及 `#lon,lat,height,heading,pitch`。
 - 调试入口：浏览器控制台里的 `window.viewer` 就是 `GeoViewer` 实例。
 
 ## 2. 目录与职责
@@ -41,11 +42,13 @@ src/
 ├─ vector/      GeoJSON 图层、矢量 Worker、注记（LabelManager）
 ├─ indoor/      BIM / 室内：schema（文档格式）、BimEntity（实体与选择器）、Building（构建与定位）、
 │               IndoorManager（层级导航、拾取、顶牌）、demoBuilding（示例数据）
-├─ markers/     MarkerManager（HTML 顶牌：投影、裁剪、避让）、cards（顶牌模板）
+├─ markers/     MarkerManager（HTML 顶牌：投影、裁剪、避让）、cards（顶牌样式模板）、
+│               points（点位解析 / 规则，纯函数）、clusterTree（层级聚合树，纯函数 + Worker）、
+│               PointLayer（点位图层）、demoPoints（示例）
 ├─ viewer/      GeoViewer（总装、拾取、帧循环）、GlobeCameraController、cameraMath、CameraFlight、
 │               InteractionManager（click / dblclick / rightclick / hover + 选择器 + 标签）
-└─ ui/          面板（ControlPanel / IndoorPanel / VectorPanel / OverlayPanel）、状态栏、属性弹窗、层级条
-tests/          vitest：geo / camera / terrain / tileSelection / tileMeshLayout / requestScheduler / vector / indoor
+└─ ui/          面板（ControlPanel / IndoorPanel / VectorPanel / PointPanel / OverlayPanel）、状态栏、属性弹窗、层级条
+tests/          vitest：geo / camera / terrain / tileSelection / tileMeshLayout / requestScheduler / vector / points / clusterTree / indoor
 docs/agents/    子系统规范（本文档的展开）
 ```
 
@@ -116,6 +119,11 @@ docs/agents/    子系统规范（本文档的展开）
 - **相机**：左键抓地平移；右键横向调航向、纵向调俯仰（默认绕屏幕中心点）；滚轮缩放到光标并保持航向和俯仰；另有环绕巡航、俯仰范围、各类开关、双击钩子。
 - **室内 / BIM**：层级为 地球 → 建筑 → 楼层 → 房间 / 设备。双击进入，右键单击或 Esc 返回，单击选中，悬停高亮。进出层级会触发 `beforeEnterLevel` / `enterLevel` / `leaveLevel` 事件。格式定义见 [indoor-bim.md](docs/agents/indoor-bim.md)。
 - **顶牌 Marker**：HTML 元素锚定在世界坐标上，每帧用 float64 投影；做地平线、距离、视口裁剪，并按优先级避让；支持数据驱动的显示模式（always / level / hover / click）。
+- **点位 PointLayer**：`viewer.addPoints({ data | url, style, rules, cluster })`。
+  - 数据可以是 GeoJSON 点、点记录数组或点位文档；样式由图层默认值、属性规则、点自带 style 依次合并。
+  - 无高度的点自动贴地。
+  - 聚合用加载时建一次的层级聚合树（借鉴 Supercluster），每帧按节点距离选层；顶牌按需创建 DOM，避让走网格索引并定时放置。见 markers.md §5。
+  - 共 8 种样式（card / pin / tag / poi / pulse / beacon / badge / label），见 markers.md。
 - **矢量**：GeoJSON 在 Worker 中解析和栅格化，按瓦片贴地；注记做屏幕空间避让。
 
 ## 5. 常见任务
@@ -126,7 +134,8 @@ docs/agents/    子系统规范（本文档的展开）
 | 新增栅格地形源 | 在 `TerrainSource.ts` 描述，写明 `tileSize`（决定取数层级偏移）和 `heightReference`。 |
 | 新增 BIM 字段 | 先改 `indoor/schema.ts` 的类型和 `parseBuildingDoc` 校验，再改 `Building` 构建，最后同步 [indoor-bim.md](docs/agents/indoor-bim.md) 并补 `tests/indoor.test.ts`。 |
 | 新增交互行为 | 用 `viewer.interaction.on(...)` 并带上 `tag`，方便整体注销；需要阻止默认行为时调用 `preventDefault()`。 |
-| 新增顶牌样式 | 在 `markers/cards.ts` 加 `style` 分支，在 `style.css` 写 `.tg-<style>`；锚点约定为元素底部中点（pivot `[0.5, 1]`）。 |
+| 新增顶牌样式 | 在 `markers/points.ts` 的 `MarkerStyleName` 加名字，在 `markers/cards.ts` 加 `style` 分支，在 `style.css` 写 `.tg-<style>`。锚点约定为元素底部中点（pivot `[0.5, 1]`）；以符号中心为锚点的样式用负下外边距让元素止于符号中心。同步 markers.md 的样式表和 `PointPanel` 的中文名。 |
+| 加载点位数据 | `viewer.addPoints(...)`、面板"点位标注"、`?points=<url>`，或拖入 `*.points.json`；规则写法见 markers.md §4。大批量（上万）或高频刷新的数值不要用 DOM 顶牌，走路线图 M3.6 / M4.6。 |
 | 调加载性能 | 先看状态栏和 `viewer.globe.stats`，再按 [tile-loading.md](docs/agents/tile-loading.md) 的调参表调整；不要改坏桶的优先顺序。 |
 
 ## 6. 提交前验证
@@ -151,6 +160,12 @@ docs/agents/    子系统规范（本文档的展开）
 - **HTML 顶牌吞事件**：双击落在顶牌上时 canvas 收不到；顶牌要自己处理单击和双击，滚轮要转发。
 - **建筑贴地后取景偏移**：页面刚打开就进入建筑时，飞行目标还是建筑贴地前的位置。贴地平移必须同步给相机（`followMove` 调用 `controller.translate`）。
 - **告警被避让隐藏**：重要信息（卡片样式）不能参与避让，只作为障碍物。
+- **顶牌数量一多就掉帧**：3000 个点时，每帧的 O(n²) 避让、每帧重算屏幕空间聚合、给所有顶牌写 transform 和随距离变化的 z-index、每个标签上的 `backdrop-filter`（每帧都要重新模糊下方的 WebGPU 画面），叠加起来会让帧率明显下降。现在的规则：
+  - 避让走 `CollisionGrid`，并定时放置。
+  - 聚合走聚合树。
+  - 样式只写变化值。
+  - 大批量显示时进入 `dense` 模式，去掉滤镜。
+  - 新增顶牌样式不要给大批量元素加 `backdrop-filter`、`filter` 或常驻动画（markers.md §5）。
 - **three 射线检测不看 `visible`**：拾取后要自行过滤不可见的对象（见 `IndoorManager.pick`）。
 - **缩放闪烁：淡入从过期画面开始**：渲染循环先置了 `visible` 和 `lastRenderedFrame` 再判断"上一帧是否在屏幕上"，结果对新上屏的瓦片永远成立，瓦片会从很久以前显示过的粗影像开始淡入。判断"上一帧是否在屏幕上"必须在更新这两个字段之前做（`showNewTile`）。
 - **缩放闪烁：缩小时先模糊再变清晰**：父瓦片的影像还没加载就替换了清晰的子瓦片。必须走不丢细节守卫（`losesDetail`），不要绕过 `TileSelection` 直接按 SSE 决定。
